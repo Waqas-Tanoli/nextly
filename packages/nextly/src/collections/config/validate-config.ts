@@ -24,7 +24,12 @@
  * ```
  */
 
+import { resolveLocalizedFieldNames } from "../../domains/i18n/classify-fields";
 import { isPluginFieldTypeOnSurface } from "../../domains/schema/field-types/field-type-registry";
+import {
+  isManagedIndexName,
+  resolveDeclaredIndexName,
+} from "../../domains/schema/pipeline/diff/index-util";
 import {
   fieldProducesColumn,
   toSnakeCase,
@@ -52,6 +57,7 @@ import {
   validatePluginFieldOptionsShared,
   validateSelectOptionsShared,
   validateSlugShared,
+  validateAccessShared,
 } from "../../shared/base-validator";
 // RESERVED_SLUGS and SQL_RESERVED_KEYWORDS used to live in this file. They
 // moved to shared/sql-reserved.ts to break a circular dependency with
@@ -212,50 +218,12 @@ const RESERVED_SLUGS_SET: Set<string> = new Set<string>([
 const INDEX_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
 
 /**
- * Extracts all field names from the fields array (including nested fields).
- * Used to validate index field references.
- */
-function extractFieldNames(
-  fields: unknown[],
-  prefix: string = ""
-): Set<string> {
-  const names = new Set<string>();
-
-  for (const field of fields) {
-    if (!field || typeof field !== "object") continue;
-    const f = field as Record<string, unknown>;
-
-    const name = f.name;
-    if (typeof name === "string") {
-      const fullName = prefix ? `${prefix}.${name}` : name;
-      names.add(name);
-      names.add(fullName);
-    }
-
-    if (Array.isArray(f.fields)) {
-      const nestedPrefix =
-        typeof name === "string"
-          ? prefix
-            ? `${prefix}.${name}`
-            : name
-          : prefix;
-      const nestedNames = extractFieldNames(
-        f.fields as unknown[],
-        nestedPrefix
-      );
-      nestedNames.forEach(n => names.add(n));
-    }
-  }
-
-  return names;
-}
-
-/**
  * Validates the indexes configuration.
  */
 function validateIndexes(
   indexes: unknown,
   fields: unknown[],
+  collectionLocalized: boolean,
   errors: ValidationError[]
 ): void {
   if (!indexes) {
@@ -271,10 +239,19 @@ function validateIndexes(
     return;
   }
 
-  const validFieldNames = extractFieldNames(fields);
-  validFieldNames.add("id");
-  validFieldNames.add("createdAt");
-  validFieldNames.add("updatedAt");
+  // Names are resolved by the schema build's own rule, so a name accepted here
+  // is one every push and migration can build. A field without a string name
+  // and type cannot be resolved; field validation reports it.
+  const namedFields = fields.filter(
+    (field): field is { name: string; type: string; options?: unknown } =>
+      typeof field === "object" &&
+      field !== null &&
+      typeof (field as { name?: unknown }).name === "string" &&
+      typeof (field as { type?: unknown }).type === "string"
+  );
+  const localizedNames = new Set(
+    collectionLocalized ? resolveLocalizedFieldNames(namedFields, true) : []
+  );
 
   indexes.forEach((index, idx) => {
     const indexPath = `indexes[${idx}]`;
@@ -327,10 +304,15 @@ function validateIndexes(
         return;
       }
 
-      if (!validFieldNames.has(fieldName)) {
+      const target = resolveDeclaredIndexName(
+        fieldName,
+        namedFields,
+        localizedNames
+      );
+      if (target.kind === "refused") {
         errors.push({
           path: `${indexPath}.fields[${fieldIdx}]`,
-          message: `Unknown field '${fieldName}' in index. Available fields: ${Array.from(validFieldNames).sort().join(", ")}`,
+          message: target.message,
           code: "INDEX_FIELD_UNKNOWN",
         });
       }
@@ -347,6 +329,19 @@ function validateIndexes(
         errors.push({
           path: `${indexPath}.name`,
           message: `Invalid index name '${i.name}'. Must start with a letter and contain only letters, numbers, and underscores`,
+          code: "INDEX_NAME_INVALID",
+        });
+      } else if (!isManagedIndexName(i.name)) {
+        // The schema diff matches an index by its columns, but drops only the
+        // names it owns: a live index under any other name may be one a
+        // database administrator added, and is left alone. A declared index
+        // named outside the prefixes would be created and then never removed
+        // when the declaration is, so the name is refused where the
+        // collection is defined rather than when its schema is first pushed.
+        const prefix = i.unique === true ? "uq_" : "idx_";
+        errors.push({
+          path: `${indexPath}.name`,
+          message: `Index name '${i.name}' must start with "idx_" or "uq_", the names schema changes manage. Rename it (for example '${prefix}${i.name}') or leave 'name' out to have one derived.`,
           code: "INDEX_NAME_INVALID",
         });
       }
@@ -625,36 +620,11 @@ function validateFields(
 }
 
 /**
- * Validates access control functions.
- * Collections support all four access keys: create, read, update, delete.
+ * Validates access control functions through the shared rule, with the keys
+ * this entity supports.
  */
 function validateAccess(access: unknown, errors: ValidationError[]): void {
-  if (!access) {
-    return;
-  }
-
-  if (typeof access !== "object" || Array.isArray(access)) {
-    errors.push({
-      path: "access",
-      message: "Access control must be an object",
-      code: "ACCESS_INVALID_TYPE",
-    });
-    return;
-  }
-
-  const accessObj = access as Record<string, unknown>;
-  const validAccessKeys = ["create", "read", "update", "delete"] as const;
-
-  for (const key of validAccessKeys) {
-    const fn = accessObj[key];
-    if (fn !== undefined && typeof fn !== "function") {
-      errors.push({
-        path: `access.${key}`,
-        message: `Access control '${key}' must be a function`,
-        code: "ACCESS_FUNCTION_INVALID",
-      });
-    }
-  }
+  validateAccessShared(access, ["create", "read", "update", "delete"], errors);
 }
 
 // ============================================================
@@ -708,7 +678,12 @@ export function validateCollectionConfig(
     (config as { status?: boolean }).status === true
   );
 
-  validateIndexes(config.indexes, config.fields, errors);
+  validateIndexes(
+    config.indexes,
+    config.fields,
+    config.localized === true,
+    errors
+  );
 
   validateAccess(config.access, errors);
 

@@ -23,6 +23,7 @@
 import { MIGRATION_TARGET } from "../domains/field-groups/migration/target";
 import { STORAGE_FORMAT } from "../schemas/storage-format";
 
+import { MAX_DECIMAL_PRECISION, MAX_DECIMAL_SCALE } from "./decimal-bounds";
 import { pluginFieldOptionIssues } from "./lib/plugin-field-options";
 import { RESERVED_SLUGS, SQL_RESERVED_KEYWORDS } from "./sql-reserved";
 
@@ -467,12 +468,6 @@ export function validateSelectOptionsShared(
   }
 }
 
-// Bounds are the most restrictive across the supported dialects so a decimal
-// field stays portable: MySQL caps DECIMAL at precision 65 and scale 30
-// (Postgres allows far more, SQLite ignores them).
-const MAX_DECIMAL_PRECISION = 65;
-const MAX_DECIMAL_SCALE = 30;
-
 /**
  * Validate the `precision`/`scale` of a `dbType: "decimal"` number field. They
  * render straight into DDL (`numeric(p,s)` / `decimal(p,s)`), so invalid
@@ -773,5 +768,41 @@ export function validateContainerFieldsShared(
     });
   } else if (Array.isArray(childFields)) {
     validateChildren(childFields, `${path}.fields`);
+  }
+}
+
+/**
+ * Validate an entity's `access` object: optional, an object when present,
+ * and each of the access keys the entity supports a function when set.
+ *
+ * Collections and Singles support different keys (Singles have no create or
+ * delete), so the caller names them; the rule applied to each is the same.
+ */
+export function validateAccessShared(
+  access: unknown,
+  accessKeys: readonly string[],
+  errors: BaseValidationError[]
+): void {
+  if (!access) return;
+
+  if (typeof access !== "object" || Array.isArray(access)) {
+    errors.push({
+      path: "access",
+      message: "Access control must be an object",
+      code: "ACCESS_INVALID_TYPE",
+    });
+    return;
+  }
+
+  const accessObj = access as Record<string, unknown>;
+  for (const key of accessKeys) {
+    const fn = accessObj[key];
+    if (fn !== undefined && typeof fn !== "function") {
+      errors.push({
+        path: `access.${key}`,
+        message: `Access control '${key}' must be a function`,
+        code: "ACCESS_FUNCTION_INVALID",
+      });
+    }
   }
 }

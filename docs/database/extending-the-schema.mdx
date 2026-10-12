@@ -1,0 +1,448 @@
+---
+title: Extending the schema
+description: Add tables and indexes of your own with a dialect-neutral DSL, ordered hooks, and a per-dialect escape hatch that refuses what migrations cannot carry.
+---
+
+# Extending the schema
+
+Your collections and singles become tables automatically. This page is about
+the rest: a join table, a cache, an index the schema pipeline would not have
+thought to create.
+
+## Three ways in
+
+| You want | Use |
+| --- | --- |
+| A field on an existing entity, with REST, admin and validation | `contributes.extend` (plugins) or the collection's own `fields` |
+| A table of your own, portable across all three dialects | `db.schema.extend` with the DSL |
+| A column or type only one dialect has | `db.schema.afterDrizzle` |
+
+## A table of your own
+
+```ts
+import { defineConfig } from "nextly";
+import { col, defineTable } from "nextly/schema-extension";
+
+const auditTrail = defineTable(
+  "audit_trail",
+  {
+    id: col.id(),
+    actorId: col.ref("users"),
+    action: col.shortText(),
+    payload: col.json<{ before?: unknown; after?: unknown }>({
+      nullable: true,
+    }),
+    ...col.timestamps(),
+  },
+  { indexes: [{ columns: ["actorId", "createdAt"] }] }
+);
+
+export default defineConfig({
+  db: {
+    schema: {
+      extend: [
+        ({ schema }) => {
+          schema.addTable(auditTrail);
+        },
+      ],
+    },
+  },
+});
+```
+
+App tables carry no prefix, and they go into your migrations like any other
+table.
+
+`col.id()` has no database default: the code that inserts a row supplies the
+`id` (any UUID fits; a UUIDv7 keeps new rows in key order), and `InferInsert`
+requires it. `col.timestamps()` defaults both columns to the current time on
+insert, but nothing refreshes `updated_at` afterwards, so set it in every
+update.
+
+A table can also declare **checks, foreign keys, and expression indexes**. They
+ride the same declaration, the same migrations, and (for checks and
+bundle-internal foreign keys) the same table rebuild on SQLite:
+
+```ts
+const orders = defineTable(
+  "orders",
+  {
+    id: col.id(),
+    userId: col.ref("users"),
+    status: col.shortText(),
+    total: col.integer({ nullable: true }),
+  },
+  {
+    checks: [{ name: "total_ok", sql: "total IS NULL OR total >= 0" }],
+    foreignKeys: [
+      {
+        columns: ["userId"],
+        references: { table: "users", columns: ["id"] },
+        onDelete: "cascade",
+      },
+    ],
+    indexes: [{ columns: ["status"], name: "idx_orders_status" }],
+  }
+);
+```
+
+A foreign key's target must exist when the migration runs; within your own
+bundle, creation order follows declaration. `onDelete` and `onUpdate` take
+`"cascade"`, `"set null"`, `"restrict"` or `"no action"` (the default).
+`"set default"` is refused, because MySQL cannot create a key that uses it.
+`"set null"`, on either side, requires every one of the key's columns to be
+nullable: MySQL refuses to create the key otherwise, and PostgreSQL and SQLite
+would fail the delete or update that fires it, so a key declaring it over a
+column that is not nullable is refused.
+
+A check's `sql` and an index's `expression` reach every dialect as written, so
+name columns bare (`qty > 0`, `lower(email)`), which all three read as the
+column. An identifier quoted with `"` or a backtick is refused: MySQL reads
+`"qty"` as a string, so `"qty" > 0` would compare a constant, and PostgreSQL
+refuses a backtick. Quotes inside a single-quoted string literal are text and
+are accepted.
+
+Partial indexes (an index with a `where` predicate) are **refused**, on every
+dialect. Every declaration is checked against PostgreSQL, MySQL and SQLite
+whichever one you run, so a table that works for you works on every
+deployment. MySQL has no partial indexes, and creating the index without its
+predicate would enforce it over rows you did not intend, so an index carrying
+`where` fails when the table is registered.
+
+An explicit index or foreign key `name` is used exactly as written, so it may
+be at most 63 characters, and so may a column's SQL name (the snake-cased key:
+`ownerAccountId` is `owner_account_id`): PostgreSQL cuts a longer name short
+and MySQL refuses one past 64. Derived names (and every check name, which is
+`ck_<table>_<name>`) are shortened with a hash when they would be longer. A
+foreign key's name, written or derived, must also be unique across the
+tables plugins and the app declare, as MySQL requires of a database, and so
+must a check's, including the one an enum column implies. An index's must be
+too, as PostgreSQL and SQLite require of a schema. Two that resolve to one
+name are refused when the schema compiles. Table and check names can meet in
+the middle: a check `a_ok` on `t` and a check `ok` on `t_a` both resolve to
+`ck_t_a_ok`, so rename one of them. The same index
+contributed to one table twice, by two plugins or a plugin and the app, is one
+index and is kept once. A foreign key's
+`references.columns` are the target's SQL column names (`owner_id`, not the
+authored `ownerId`), and a column the target does not have is refused. So is a
+key column whose type cannot reference its target's on every dialect: an
+integer on a text column or a `uuid` on a text one (PostgreSQL has no equality
+between them), integers or floats of different widths (`bigint` on `integer`,
+`double` on `real`), or decimals of a different precision or scale (MySQL
+requires both to match), and a long text, JSON or
+bytes column in a key at all (MySQL cannot index one). Text columns of
+different lengths may reference each other, and a collection's relationship
+column is the text id it holds. When the target is a table a plugin or the
+app declares, the referenced columns must be its primary key or a unique
+index over exactly those columns, in the index's order: PostgreSQL refuses
+any other target, and MySQL matches the columns in order. A core table's
+columns, a collection's, and an adopted table's are left to the database to
+judge, since their keys are not all in a declaration.
+
+A default must be one every dialect stores as written. Its type must be the
+column's: a string for a text or `uuid` column, a number for a numeric one, a
+boolean for `col.boolean()`, and only the current-timestamp token (what
+`col.timestamps()` sets) for a timestamp. A `uuid` default must be a UUID in
+lower-case hex, `0190c4c2-7f3a-7b9e-8d1a-3c5e7f9a1b2c`. A text default may be
+no wider than its column on MySQL: 255 characters for `col.text()` and
+`col.shortText()`, `n` for `col.varchar(n)` and `col.char(n)`, unbounded for
+`col.longText()`; and no string default may hold a NUL character. A numeric
+default must be a finite number. An integer column's must be a whole number
+within the column's range (`smallint` up to 32,767, `integer` up to
+2,147,483,647, `bigint` within ±2^53 − 1, the integers a JavaScript number
+holds exactly); a `real` default must be within a 4-byte float's range; and
+a decimal's default must fit its column: no more fractional digits than its
+scale, and no more digits before the point than its precision leaves room for
+(`col.decimal(3, 1)` holds up to `99.9`). JSON, bytes, enum and serial
+columns take no default.
+
+A table's columns must fit in one MySQL row: 65,535 bytes, where a
+`varchar(n)` counts up to 4 bytes a character plus its length, and a
+`longText` or `json` column counts only a few bytes because its contents are
+stored apart. `col.varchar(n)` accepts at most 16,383 characters, the widest
+MySQL can declare, and a table whose columns together do not fit is refused
+when the schema compiles, on every dialect. An adopted table describing a
+wider existing column declares it with `col.longText()`, which reads and
+writes the same strings.
+
+## Adopt an existing table
+
+```ts
+db: {
+  schema: {
+    extend: [
+      ({ schema }) => {
+        schema.adoptTable(defineTable("legacy_orders", {
+          id: col.id(),
+        }));
+      },
+    ],
+  },
+}
+```
+
+`adoptTable` claims a table Nextly does not own: the table is registered for
+typed Drizzle access and relation queries, and **nothing else** — no DDL, no
+diff, no migration, never dropped. The name is used as written, and adopting a managed
+table's name is refused.
+
+## Relations
+
+Tables declared with `ref()` columns carry a one-edge automatically, named for
+what it points at: `ownerId: col.ref("app__owners")` is read with
+`with: { owner: true }`, while the row keeps `ownerId` as the column. A key
+without an `Id` suffix gets `<key>Ref`. A relation and a column share the row's
+keys, so a declared relation may not reuse a column's name, and each relation
+on a table needs a name of its own. Any table can declare more relations:
+
+```ts
+const linked = defineTable("linked", {
+  id: col.id(),
+  orderId: col.shortText(),
+}, {
+  relations: [{ name: "order", kind: "one", targetTable: "app__orders", fromColumn: "orderId" }],
+});
+```
+
+A `one` edge joins its `fromColumn` to the target's `toColumn` (its `id` when
+omitted). A `many` edge is the reverse — the target holds the column pointing
+back — so it names that `toColumn`, and joins it to its own `fromColumn` or,
+when that is omitted, its primary key. A `toColumn` may be written as the SQL
+column or the key, and must name a column of a table in this schema or of a
+core table; a relation to a collection or single joins its `id` and names no
+`toColumn`.
+
+Edges register with the schema registry, so `db.query.<table>.findMany({ with })`
+follows them between tables you may reach. An include and a relation filter
+in `where` obey the same rule as `db.query.<table>` itself, at every depth: the
+app reaches its own tables, and a plugin its own and those of the plugins in
+its `dependsOn`. An edge to a core table or a collection — the one
+`col.ref("users")` carries included — is declared and typed, but following it
+is refused like `db.query.users` is; read those rows through the
+[Direct API](/docs/api-reference/direct-api) (or `ctx.services` in a plugin),
+where access control, validation and hooks apply, and join on the id the
+column holds.
+
+## Indexes on your collections
+
+`indexes` on a collection config now reaches the database. If you declared one
+before and never saw it, the next dev push or `migrate:create` will add it.
+
+```ts
+defineCollection({
+  slug: "places",
+  fields: [text({ name: "country" }), text({ name: "city" })],
+  indexes: [{ fields: ["country", "city"], unique: true }],
+});
+```
+
+<Callout type="warn">
+A unique index over columns that already contain duplicate rows will fail to
+build. Find them first:
+
+```sql
+SELECT country, city, COUNT(*)
+FROM dc_places
+GROUP BY country, city
+HAVING COUNT(*) > 1;
+```
+</Callout>
+
+Column order matters. Only `(country, city)` serves a lookup on `country`
+alone.
+
+## The escape hatch
+
+When you need something the neutral model has no word for — a `bigint`, a
+`char(3)`, a type one dialect has and the others do not — reshape the Drizzle
+table directly:
+
+```ts
+db: {
+  schema: {
+    afterDrizzle: [
+      ({ dialect, tables }) => {
+        if (dialect !== "postgresql") return tables;
+        return {
+          ...tables,
+          app_ledger: pgTable("app_ledger", {
+            id: varchar("id", { length: 36 }).primaryKey(),
+            amountMinor: bigint("amount_minor", { mode: "bigint" }),
+          }),
+        };
+      },
+    ],
+  },
+}
+```
+
+This is the app's alone; plugins have no equivalent, because a per-dialect
+choice about your database is yours rather than a plugin's.
+
+What a hook may return, and what happens to it:
+
+- **A table it reshapes** keeps everything its declaration says that the hook
+  did not change. A Drizzle table has to be rebuilt to change one column, and
+  the rebuilt one rarely restates the indexes, checks, foreign keys and serial
+  keys the declaration carries, so those are kept rather than dropped. Only
+  column changes and newly declared indexes are taken from the hook's table.
+  Removing a column also removes what exists only because of it: the
+  `col.enum()` check on it, and the foreign keys and indexes that name it.
+  Removing a column that a declared `checks` entry names, or that a relation
+  joins on, is refused at boot, naming the check or the relation.
+- **A table it introduces** belongs to the app and meets the naming rule every
+  app table meets: no managed prefix (`dc_`, `single_`, `comp_`, `nextly_`),
+  no `_locales` suffix, no core table's name and nothing inside a plugin's
+  namespace.
+- **Relations** follow the table the hook returns. Keying the rebuilt table's
+  columns by SQL name rather than by the declared keys is fine.
+- A core, entity, adopted or plugin table is refused.
+
+An `extend` hook sees the core tables, plugin and app tables, and the
+collections, Singles and field groups declared in code; an entity created in
+the admin's Schema Builder is not known when it runs, so it cannot target that
+table. An `afterDrizzle` hook is narrower: the `tables` it receives are the
+plugin and app tables only, and it may return only app tables.
+
+Anything the schema model cannot carry into migrations and drift detection is
+**refused at boot**, naming the table and the construct — because the
+alternative is a constraint that exists on your machine and on no deployment,
+with nothing reporting the difference. Checks, foreign keys and expression
+indexes all carry through the DSL above; the escape hatch refuses
+them because the DSL is the one path that keeps them in migrations and drift.
+
+## Coming from Payload
+
+| Payload | Nextly |
+| --- | --- |
+| `beforeSchemaInit` | `db.schema.extend`, which also runs for plugins |
+| `afterSchemaInit` | `db.schema.afterDrizzle`, with loss checking |
+| `extendTable` | `schema.extendTable`, with ownership rules |
+| `rawTables` | `defineTable` + `col.*`, the primary path rather than an escape |
+| Collection `indexes` | Collection `indexes`, now actually emitted |
+| `.references()` / `RawForeignKey` | `foreignKeys` on `defineTable` |
+| `check()` | `checks` on `defineTable` |
+| `defaultIDType` | `db.idType` per collection (`uuid` or `uuidv7`) |
+| A client-supplied `id` on create | `db.allowIdOnCreate` per collection |
+| `.where()` partial index | not supported: refused on every dialect, because MySQL has none |
+| `relations()` | `relations` on `defineTable` + `ref()` auto-edges |
+| `pgEnum` | `col.enum([...])` — stored as text (`varchar(255)` on MySQL), values enforced by a CHECK on every dialect |
+| `schemaName` | not yet — `db.postgres.schema` accepts only `"public"` |
+| `generate:db-schema` | not needed — types come from the declaration |
+
+Two differences worth knowing:
+
+Payload's hooks are app-only. Ours accept plugins too, in dependency order,
+with ownership recorded on every table, index, check and foreign key — so two
+plugins cannot quietly fight over one table.
+
+Payload's `extendTable` reaches into Drizzle's internal symbols, and its hook
+tables lose their types. Ours build Drizzle objects from the neutral model and
+type them from the declaration (`InferRow`, `InferInsert`), with no codegen step.
+
+## The PostgreSQL schema
+
+On PostgreSQL every managed table, index and constraint lives in `public`.
+`db.postgres.schema` is reserved for choosing another schema, but only
+`"public"` is supported today:
+
+```ts
+import { defineConfig } from "nextly";
+
+export default defineConfig({
+  // The only accepted value for now; leaving it out means the same thing.
+  db: { postgres: { schema: "public" } },
+});
+```
+
+Any other value is refused when the server boots and by every `nextly`
+command, with an error naming the value. The schema push cannot yet create
+tables outside `public`, so an installation pointed at another schema would
+start with none of its core tables. Remove the option, or set it to
+`"public"`. A database adapter you construct yourself must not set a schema of
+its own either; one that disagrees with the config is refused at boot.
+
+MySQL and SQLite have no equivalent (MySQL's schema IS its database, SQLite is
+one file). They ignore the setting and warn, so a config shared across
+dialects does not have to branch.
+
+## Generated integer keys
+
+`col.serial()` IS the table's key — it replaces `col.id()` rather than
+joining it. No dialect assigns a value to a serial column that is not a key:
+MySQL refuses `AUTO_INCREMENT` on one, and SQLite assigns only to an
+`INTEGER PRIMARY KEY`. Declaring both is refused, naming the two columns.
+
+```ts
+defineTable("counters", {
+  seq: col.serial(),
+  label: col.shortText(),
+});
+```
+
+`serial` on PostgreSQL, `int AUTO_INCREMENT` on MySQL, and on SQLite a plain
+`INTEGER` primary key, which is the rowid alias and auto-assigns. Never
+nullable and never written — the database assigns it, so a value you supply is
+one the sequence does not know about.
+
+Only on a table its own owner declares. Added to somebody else's, it would be
+a second auto-assigning column on a row whose identity is already decided, and
+MySQL will not accept a second AUTO_INCREMENT column at all.
+
+## Enums
+
+```ts
+defineTable("orders", {
+  id: col.id(),
+  state: col.enum(["open", "closed"]),
+});
+```
+
+The column is text — `varchar(255)` on MySQL, so it can be indexed, which
+also caps each value at 255 characters on every dialect — and the values are
+enforced by a CHECK constraint, on all three dialects. That is a deliberate
+trade: a native PostgreSQL enum is a
+schema object with its own lifecycle — created before the table, altered by
+`ALTER TYPE ... ADD VALUE`, dropped after its last column — while MySQL spells
+it inline and SQLite has nothing. A CHECK is one mechanism this pipeline
+already diffs, emits and introspects everywhere.
+
+Adding a value is an ordinary constraint change. **Removing one is refused by
+the database** while a row still holds it, which is the correct answer: the
+rows would otherwise violate the constraint the moment it applied.
+
+The CHECK is named `ck_<table>_<column>_enum`. `col.enum(values, { name })`
+replaces the column part only: the constraint is `ck_<table>_<name>`, so the
+same name can be given to enums on several tables (MySQL requires check names
+to be unique across the whole database). It names the constraint, not a
+PostgreSQL enum type.
+
+## Columns on a table you do not own
+
+`extendTable` accepts `columns` as well as `indexes`, on your own tables, on
+entity tables, on the extendable core tables, and — for the app, or for a
+plugin naming the owner in `dependsOn` — on another owner's tables.
+
+A column added this way is **hidden from the entry API**: it is on the table,
+so migrations and SQLite rebuilds keep it, and it is stripped from every REST
+response, Direct API read, version snapshot and webhook payload, while a value
+sent for it on an entry write is dropped. Both halves matter — unhidden it
+leaks into every response, and absent from the runtime table the next push
+proposes dropping it. A read cannot probe its values either: a `where` naming
+it is refused with `FIELD_NOT_FILTERABLE` (for a column on a component's
+table, under the component field's path, such as `seo.searchVector`), a group
+key naming it is refused, and a sort by it is ignored.
+
+## What is not supported
+
+Views; native PostgreSQL enum TYPES (the values are a CHECK instead, see
+above); partial (`where`) indexes, on any dialect; `col.serial()` on a table you do not own — a generated key belongs to
+the table that declares it, and MySQL will not take a second AUTO_INCREMENT
+column anyway; columns added to an extendable CORE table are not created by
+dev push, because core tables are migration-owned and the column arrives with
+the app's migrations (`nextly migrate:create` in the app writes it, whoever
+contributed it); `col.ref()` alone records a reference for documentation and validation
+— a constraint comes from `foreignKeys`. Resizing a `varchar(n)` or
+`decimal(p, s)` produces no migration — the diff normalises type modifiers
+away, and collections behave the same. Add a new column and migrate the data
+across.

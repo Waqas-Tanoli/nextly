@@ -20,11 +20,12 @@ import {
   index,
 } from "drizzle-orm/mysql-core";
 
-import type {
-  SchemaEventScopeKind,
-  SchemaEventSource,
-  SchemaEventStatus,
-  SchemaEventType,
+import {
+  SCHEMA_EVENTS_FILENAME_MAX_LENGTH,
+  type SchemaEventScopeKind,
+  type SchemaEventSource,
+  type SchemaEventStatus,
+  type SchemaEventType,
 } from "./types";
 
 export const nextlySchemaEventsMysql = mysqlTable(
@@ -44,7 +45,9 @@ export const nextlySchemaEventsMysql = mysqlTable(
       .$type<SchemaEventSource>()
       .notNull(),
 
-    filename: varchar("filename", { length: 255 }),
+    filename: varchar("filename", {
+      length: SCHEMA_EVENTS_FILENAME_MAX_LENGTH,
+    }),
     sha256: varchar("sha256", { length: 64 }),
 
     scopeKind: varchar("scope_kind", {

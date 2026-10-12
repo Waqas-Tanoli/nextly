@@ -27,22 +27,32 @@
 
 import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
 
+import { NextlyError } from "../../../../errors/nextly-error";
 import { STORAGE_FORMAT } from "../../../../schemas/storage-format";
 import { resolveLocalizedFieldNames } from "../../../i18n/classify-fields";
 import {
+  assertIndexBuildable,
+  type WeighedColumn,
+} from "../../extension/naming";
+import {
   getColumnDescriptor,
   type ColumnOrigin,
-  getSystemColumnDescriptors,
-  toSnakeCase,
+  kindAndSizes,
+  systemColumnsForFields,
 } from "../../services/field-column-descriptor";
 import {
   columnTypeIsIndexable,
   indexNameForColumn,
+  indexNameForColumns,
   uniqueIndexNameForColumn,
   uniquenessCanBeAnIndex,
 } from "../../services/index-name";
 
-import { indexKey } from "./index-util";
+import {
+  indexKey,
+  isManagedIndexName,
+  resolveDeclaredIndexName,
+} from "./index-util";
 import type { ColumnSpec, IndexSpec, TableSpec } from "./types";
 
 /**
@@ -93,6 +103,13 @@ export interface BuildDesiredTableOptions {
    * and the diff has to describe the column the way whatever built it did.
    */
   builtBy: ColumnOrigin;
+  /**
+   * Compound indexes the entity's config declared.
+   *
+   * Code-first entities only: registry rows (Builder-created entities) store
+   * no indexes, so a Builder collection cannot declare one in v1.
+   */
+  indexes?: readonly DeclaredIndex[];
 }
 
 /**
@@ -104,6 +121,20 @@ export interface BuildDesiredTableOptions {
  * runtime-schema-generator's behavior — the descriptor module owns that list.
  */
 /** Inputs the index rules need that only the caller can determine. */
+/**
+ * A compound index an entity declared in its config, or that a schema hook
+ * contributed to an entity table.
+ *
+ * Named separately from `IndexConfig` so the diff layer does not import the
+ * collections config surface: this is the shape, whoever supplied it.
+ */
+export interface DeclaredIndex {
+  /** FIELD names as authored. Order is significant. */
+  fields: string[];
+  unique?: boolean;
+  name?: string;
+}
+
 interface CollectionIndexContext<F> {
   hasSlugColumn: boolean;
   hasCreatedAtColumn: boolean;
@@ -119,6 +150,30 @@ interface CollectionIndexContext<F> {
    * change would otherwise produce indexes naming columns that do not exist.
    */
   columnNameFor: (field: F) => string | null;
+  /**
+   * Compound indexes the config declared, which nothing emitted before.
+   *
+   * `CollectionConfig.indexes` has been validated and then discarded since it
+   * was added, so an app that declared one has been running without it.
+   */
+  declaredIndexes?: readonly DeclaredIndex[];
+  /**
+   * The logical kind of the column a field materialises, with the sizes that
+   * kind reads, or null when it materialises none.
+   *
+   * Needed because a declared index is refused for ALL THREE dialects rather
+   * than the live one: an index that only works where its author develops is a
+   * deployment failure with no local reproduction. The width matters as much
+   * as the kind: MySQL limits a whole key to 3,072 bytes, so four ordinary
+   * text fields can each be keyable and their index still not be.
+   */
+  columnFor?: (field: F) => Omit<WeighedColumn, "name"> | null;
+  /**
+   * The system columns this table carries, by column name, weighed as the
+   * index rules weigh a column. A declared index may name `id`, `createdAt`
+   * or `updatedAt`, and resolves them here rather than among the fields.
+   */
+  systemColumns?: ReadonlyMap<string, Omit<WeighedColumn, "name">>;
   /**
    * Whether an index on this column can exist at all, asked per column.
    *
@@ -228,7 +283,132 @@ export function collectionIndexSpecs<F extends MinimalFieldDef>(
       });
     }
   }
+  indexes.push(...declaredIndexSpecs(tableName, fields, context));
+  // What schema hooks contributed to the table is applied afterwards, by
+  // `withEntityContributions`, over the spec this builds — the one helper dev
+  // push and the migration stream share.
   return dedupeIndexes(indexes);
+}
+
+/**
+ * The specs for indexes the config DECLARED, as opposed to those derived from
+ * individual fields.
+ *
+ * Refused rather than skipped when a field cannot carry one. Skipping would
+ * mean an author writes a unique compound index, sees no error, and discovers
+ * on the first duplicate row that it was never created.
+ */
+function declaredIndexSpecs<F extends MinimalFieldDef>(
+  tableName: string,
+  fields: readonly F[],
+  context: CollectionIndexContext<F>
+): IndexSpec[] {
+  const declared = context.declaredIndexes ?? [];
+  if (declared.length === 0) return [];
+
+  return declared.map(entry => {
+    const path = `${tableName}.indexes`;
+    if (entry.fields.length === 0) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path,
+            code: "INVALID",
+            message: "An index must name at least one field.",
+          },
+        ],
+      });
+    }
+    if (entry.name !== undefined && !isManagedIndexName(entry.name)) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path,
+            code: "INVALID",
+            message: `An explicit index name must start with "idx_" or "uq_"; "${entry.name}" would never be reconciled by the diff engine.`,
+          },
+        ],
+      });
+    }
+
+    const resolved = entry.fields.map(fieldName =>
+      declaredIndexColumn(tableName, fieldName, fields, context)
+    );
+    const columns = resolved.map(column => column.name);
+    const unique = entry.unique === true;
+    // Judged by the rules an extension table's index is judged by, on every
+    // dialect: which kinds can be keyed or carry uniqueness, and MySQL's
+    // limit on the whole key's width. A column whose kind the caller could
+    // not supply is left out, and the width is then not summed over the part
+    // that is known — a total too small passes for the wrong reason.
+    const weighed = resolved.flatMap(column =>
+      column.weighed === null ? [] : [column.weighed]
+    );
+    assertIndexBuildable(
+      {
+        columns,
+        unique,
+        ...(entry.name !== undefined ? { name: entry.name } : {}),
+      },
+      weighed,
+      tableName,
+      weighed.length === resolved.length
+    );
+    return {
+      name: entry.name ?? indexNameForColumns(tableName, columns, unique),
+      columns,
+      unique,
+    };
+  });
+}
+
+/**
+ * The column one declared index field resolves to, or a refusal: its name,
+ * and the column as the index rules weigh it when the caller can say.
+ */
+function declaredIndexColumn<F extends MinimalFieldDef>(
+  tableName: string,
+  fieldName: string,
+  fields: readonly F[],
+  context: CollectionIndexContext<F>
+): { name: string; weighed: WeighedColumn | null } {
+  const refuse = (message: string): never => {
+    throw NextlyError.validation({
+      errors: [{ path: `${tableName}.indexes`, code: "INVALID", message }],
+    });
+  };
+
+  const target = resolveDeclaredIndexName(
+    fieldName,
+    fields,
+    context.localizedNames
+  );
+  if (target.kind === "refused") return refuse(target.message);
+
+  if (target.kind === "system") {
+    // A system column is weighed from its own descriptor, the same way a
+    // field's is, so the MySQL key-width check counts it rather than skipping
+    // it. Absent from the map means this table does not carry the column.
+    const system = context.systemColumns?.get(target.column);
+    if (system === undefined) {
+      return refuse(
+        `Index names "${fieldName}", whose system column "${target.column}" this table does not carry.`
+      );
+    }
+    return { name: target.column, weighed: { ...system, name: target.column } };
+  }
+
+  const column = context.columnNameFor(target.field);
+  if (column === null) {
+    return refuse(
+      `Index names the field "${fieldName}", which materialises no column on this table.`
+    );
+  }
+  const described = context.columnFor?.(target.field) ?? null;
+  return {
+    name: column,
+    weighed: described === null ? null : { ...described, name: column },
+  };
 }
 
 export function buildDesiredTableFromFields(
@@ -247,34 +427,21 @@ export function buildDesiredTableFromFields(
     ? new Set(resolveLocalizedFieldNames(fields, true))
     : new Set<string>();
 
-  // A field materializes a parent column unless the descriptor skips it (a
-  // component field stores its data in its own table). Column-less fields must
-  // not suppress the system title/slug column nor receive an index.
-  const producesColumn = (f: (typeof fields)[number]): boolean =>
-    getColumnDescriptor(
-      f as unknown as Parameters<typeof getColumnDescriptor>[0],
-      dialect,
-      options.builtBy
-    ) !== null;
-
-  // Inject reserved system columns first - mirrors runtime-schema-generator's
-  // behavior. title/slug only when a column-producing user field replaces them
-  // (user wins). status only when Draft/Published is enabled.
-  // Matched on the COLUMN the field becomes, so this agrees with the runtime schema and the DDL
-  // generator. Comparing declared names makes `Title` suppress the column in one place and not
-  // the others, and the diff then reconciles a column the table does not have.
-  const declaresColumn = (column: string): boolean =>
-    fields.some(f => toSnakeCase(f.name) === column && producesColumn(f));
-  const hasTitleField = declaresColumn("title");
-  const hasSlugField = declaresColumn("slug");
-  for (const reserved of getSystemColumnDescriptors(dialect, {
-    hasTitleField,
-    hasSlugField,
-    hasStatus: options.hasStatus,
-    // Singles (`single_` prefix) get no owner column; collections (`dc_`) do.
-    // Keeps the diff input in lockstep with the runtime schema and DDL.
-    isSingle: tableName.startsWith("single_"),
-  })) {
+  // Reserved system columns first, as the runtime schema injects them: the
+  // same helper decides which a user field replaces, so the diff input stays in
+  // lockstep with the runtime schema and DDL. status only when Draft/Published
+  // is enabled.
+  const systemColumns = systemColumnsForFields(
+    fields as unknown as Parameters<typeof systemColumnsForFields>[0],
+    dialect,
+    {
+      builtBy: options.builtBy,
+      hasStatus: options.hasStatus,
+      // Singles (`single_` prefix) get no owner column; collections (`dc_`) do.
+      isSingle: tableName.startsWith("single_"),
+    }
+  );
+  for (const reserved of systemColumns) {
     columns.push({
       name: reserved.name,
       type: reserved.dialectType,
@@ -333,6 +500,23 @@ export function buildDesiredTableFromFields(
         dialect,
         options.builtBy
       )?.name ?? null,
+    columnFor: field => {
+      const descriptor = getColumnDescriptor(
+        field as unknown as Parameters<typeof getColumnDescriptor>[0],
+        dialect,
+        options.builtBy
+      );
+      // A field stored in another table has no column to weigh.
+      if (descriptor === null || descriptor.kind === "skip") return null;
+      // The kind narrowed past `skip`, which the object itself is not.
+      return kindAndSizes({ ...descriptor, kind: descriptor.kind });
+    },
+    systemColumns: new Map(
+      systemColumns.map(column => [column.name, kindAndSizes(column)])
+    ),
+    ...(options.indexes !== undefined
+      ? { declaredIndexes: options.indexes }
+      : {}),
   });
 
   return { name: tableName, columns, indexes };

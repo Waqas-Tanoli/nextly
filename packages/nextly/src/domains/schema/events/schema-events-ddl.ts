@@ -10,7 +10,25 @@
  * @since v0.0.3-alpha (Plan B)
  */
 
+import { SCHEMA_EVENTS_FILENAME_MAX_LENGTH } from "../../../schemas/schema-events/types";
+
 type Dialect = "postgresql" | "mysql" | "sqlite";
+
+/**
+ * Create the events table and its indexes when the database does not have
+ * it: the one ledger bootstrap the CLI, the production boot and the
+ * development boot each run before a migrate records anything.
+ */
+export async function ensureSchemaEventsTable(adapter: {
+  dialect: Dialect;
+  tableExists(name: string): Promise<boolean>;
+  executeQuery(sql: string): Promise<unknown>;
+}): Promise<void> {
+  if (await adapter.tableExists("nextly_schema_events")) return;
+  for (const stmt of getSchemaEventsDdl(adapter.dialect)) {
+    await adapter.executeQuery(stmt);
+  }
+}
 
 /** Returns the ordered DDL statements that create the events table + indexes. */
 export function getSchemaEventsDdl(dialect: Dialect): string[] {
@@ -56,7 +74,7 @@ export function getSchemaEventsDdl(dialect: Dialect): string[] {
           event_type VARCHAR(32) NOT NULL,
           status VARCHAR(32) NOT NULL,
           source VARCHAR(32) NOT NULL,
-          filename VARCHAR(255),
+          filename VARCHAR(${SCHEMA_EVENTS_FILENAME_MAX_LENGTH}),
           sha256 VARCHAR(64),
           scope_kind VARCHAR(32),
           scope_slug VARCHAR(255),

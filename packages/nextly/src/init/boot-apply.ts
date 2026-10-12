@@ -33,22 +33,44 @@
 // runs first. Both need the same boot-apply behavior, so the logic
 // is centralized here and called from both.
 
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import type { LoadConfigResult } from "../cli/utils/config-loader";
+import type { ExtensionSchema } from "../domains/schema/extension/build-extension-schema";
+import type {
+  PluginMigrationSet,
+  pluginMigrationArgs,
+} from "../domains/schema/migrate/plugin/run-plugin-migrations";
+
 import { reloadDynamicTables } from "./reload-dynamic-tables";
 
 const callerLabel = (caller?: string): string =>
   caller ? `[Nextly:${caller}]` : "[Nextly]";
 
+/**
+ * Whether this process applies code-first schema on boot: development, and not
+ * opted out with `NEXTLY_DISABLE_BOOT_APPLY=1`.
+ *
+ * One predicate for everything that creates schema outside migrations at boot
+ * — the development push below and the creation of missing extension tables in
+ * `registerServices` — so an opt-out that stops one stops both.
+ */
+export function bootApplyEnabled(): boolean {
+  return (
+    process.env.NODE_ENV === "development" &&
+    process.env.NEXTLY_DISABLE_BOOT_APPLY !== "1"
+  );
+}
+
 export async function runBootTimeApplyIfDev(opts?: {
   caller?: string;
 }): Promise<void> {
-  if (process.env.NODE_ENV !== "development") return;
-
-  if (process.env.NEXTLY_DISABLE_BOOT_APPLY === "1") return;
+  if (!bootApplyEnabled()) return;
 
   const label = callerLabel(opts?.caller);
   try {
     // Step 1: Apply pending SQL migrations first (lock-guarded, safe across workers)
-    await applyPendingMigrations(label);
+    const registeredByMigrate = await applyPendingMigrations(label);
 
     // Step 1.5: Register collections from migration metadata
     // NOTE: This runs OUTSIDE the migrate lock. Multiple Next.js dev workers may
@@ -56,7 +78,15 @@ export async function runBootTimeApplyIfDev(opts?: {
     // can both check existence, then both insert), but slug unique constraints
     // prevent duplicates. If a worker loses the race, it continues normally.
     // Any metadata-table-to-physical-table mismatch self-heals on next boot.
-    await registerMigrationMetadata(label);
+    const registeredFromSnapshots = await registerMigrationMetadata(label);
+
+    // Migration-created collections and singles need permissions just like
+    // code-first ones. Either step may have registered them — the migrate
+    // run's own metadata phase first, the snapshot pass after it finding
+    // nothing left — so the seeding follows both.
+    if (registeredByMigrate + registeredFromSnapshots > 0) {
+      await seedPermissionsForMigrationCollections(label);
+    }
 
     // Step 1.6: Reload dynamic tables into the schema registry.
     // The registry was built by `registerServices` before any of the above ran,
@@ -92,6 +122,25 @@ export async function runBootTimeApplyIfDev(opts?: {
 }
 
 /**
+ * The app's configuration and the path of its migrations directory, read as
+ * `nextly migrate` reads them. The directory need not exist: what its absence
+ * means differs by caller, so each asks about it on its own.
+ */
+async function bootMigrateConfig(): Promise<{
+  configResult: LoadConfigResult;
+  migrationsDir: string;
+}> {
+  const path = await import("path");
+  const { loadConfig } = await import("../cli/utils/config-loader");
+  const configResult = await loadConfig({ cwd: process.cwd() });
+  const migrationsDir = path.join(
+    process.cwd(),
+    configResult.config.db.migrationsDir
+  );
+  return { configResult, migrationsDir };
+}
+
+/**
  * Register collections from migration metadata at boot time (development only).
  *
  * This bridges the gap for visual approach templates where:
@@ -107,27 +156,17 @@ export async function runBootTimeApplyIfDev(opts?: {
  * Without this, the collections registry stays empty because visual.config.ts has
  * empty collections array (by design - users create collections via Admin Panel).
  */
-async function registerMigrationMetadata(label: string): Promise<void> {
+async function registerMigrationMetadata(label: string): Promise<number> {
   try {
+    const { migrationsDir } = await bootMigrateConfig();
     const fs = await import("fs");
     const path = await import("path");
 
-    // Load config FIRST to get configured migrationsDir
-    const { loadConfig } = await import("../cli/utils/config-loader");
-    const configResult = await loadConfig({ cwd: process.cwd() });
-    const migrationsDir = path.join(
-      process.cwd(),
-      configResult.config.db.migrationsDir
-    );
-
-    if (!fs.existsSync(migrationsDir)) {
-      return; // No migrations directory, skip
-    }
-
-    // Check if meta directory exists
+    // The snapshots live in `meta` inside the migrations directory; a project
+    // without that directory, or without its `meta`, has none to register.
     const metaDir = path.join(migrationsDir, "meta");
     if (!fs.existsSync(metaDir)) {
-      return; // No metadata, skip
+      return 0;
     }
 
     // Import the registration function
@@ -143,7 +182,7 @@ async function registerMigrationMetadata(label: string): Promise<void> {
       console.warn(
         `${label} Adapter not available for migration metadata registration. Run \`nextly migrate\` manually.`
       );
-      return;
+      return 0;
     }
 
     const adapter = drizzleAdapter as {
@@ -165,15 +204,13 @@ async function registerMigrationMetadata(label: string): Promise<void> {
       logger,
     });
 
-    if (result.collectionsRegistered > 0 || result.singlesRegistered > 0) {
+    const registered = result.collectionsRegistered + result.singlesRegistered;
+    if (registered > 0) {
       console.log(
         `${label} ✅ Registered ${result.collectionsRegistered} collection(s), ${result.singlesRegistered} single(s) from migration metadata`
       );
-
-      // Seed permissions for newly registered collections and singles
-      // Migration-created collections need permissions just like code-first ones
-      await seedPermissionsForMigrationCollections(label);
     }
+    return registered;
   } catch (err) {
     // Metadata registration failed - log but don't block startup
     const msg = err instanceof Error ? err.message : String(err);
@@ -181,6 +218,7 @@ async function registerMigrationMetadata(label: string): Promise<void> {
       `${label} Migration metadata registration skipped: ${msg}. ` +
         `Collections from migrations may not be available.`
     );
+    return 0;
   }
 }
 
@@ -253,21 +291,29 @@ async function seedPermissionsForMigrationCollections(
  * - Get proper error handling instead of exit codes
  * - Use the intended injectable migrateCore seam
  */
-async function applyPendingMigrations(label: string): Promise<void> {
+async function applyPendingMigrations(label: string): Promise<number> {
   try {
+    const { configResult, migrationsDir } = await bootMigrateConfig();
+
+    // A configured plugin's modules run whether or not the app has a
+    // migrations directory: they ship with the plugin, and every reader
+    // `migrateCore` uses takes an absent directory as no app files. They are
+    // read through `pluginMigrationArgs`, as the CLI and the production boot
+    // read them, and the run is skipped only when there is no directory and
+    // that same source names no module, so a project with neither still
+    // returns before `migrateCore` and the schema it compiles are loaded.
     const fs = await import("fs");
-    const path = await import("path");
-
-    // Load config FIRST to get configured migrationsDir
-    const { loadConfig } = await import("../cli/utils/config-loader");
-    const configResult = await loadConfig({ cwd: process.cwd() });
-    const migrationsDir = path.join(
-      process.cwd(),
-      configResult.config.db.migrationsDir
+    const { pluginMigrationArgs } = await import(
+      "../domains/schema/migrate/plugin/run-plugin-migrations"
     );
-
-    if (!fs.existsSync(migrationsDir)) {
-      return; // No migrations directory, skip
+    const pluginMigrations = await pluginMigrationArgs(
+      configResult.config.plugins ?? []
+    );
+    if (
+      !fs.existsSync(migrationsDir) &&
+      pluginMigrations.pluginMigrationSets.length === 0
+    ) {
+      return 0;
     }
 
     console.log(`${label} Checking for pending migrations...`);
@@ -284,77 +330,17 @@ async function applyPendingMigrations(label: string): Promise<void> {
         `${label} Database environment invalid. Run \`nextly migrate\` manually.`,
         ...dbValidation.errors.map(e => `  - ${e}`)
       );
-      return;
+      return 0;
     }
 
     // Get adapter from DI (consistent with reloadDynamicTables)
-    const drizzleAdapter = container.get("adapter");
+    const drizzleAdapter = container.get<DrizzleAdapter | undefined>("adapter");
 
     if (!drizzleAdapter) {
       console.warn(
         `${label} Adapter not available. Run \`nextly migrate\` manually.`
       );
-      return;
-    }
-
-    // Get db instance from adapter
-    const db = (
-      drizzleAdapter as { getDrizzle?: () => unknown }
-    ).getDrizzle?.();
-
-    if (!db) {
-      console.warn(
-        `${label} Database instance not available. Run \`nextly migrate\` manually.`
-      );
-      return;
-    }
-
-    // Import getSchemaEventsDdl for ledger bootstrap
-    const { getSchemaEventsDdl } = await import(
-      "../domains/schema/events/schema-events-ddl"
-    );
-
-    const allowCoreDestructive = true;
-
-    // Get dialect from adapter
-    const adapterDialect = (
-      drizzleAdapter as { dialect: "postgresql" | "mysql" | "sqlite" }
-    ).dialect;
-
-    // Create a CLI adapter wrapper for migrateCore
-    const cliAdapter = {
-      dialect: adapterDialect,
-      connect: () => Promise.resolve(),
-      disconnect: () =>
-        (drizzleAdapter as { disconnect: () => Promise<void> }).disconnect(),
-      isConnected: () => true,
-      getCapabilities: () => ({
-        dialect: adapterDialect,
-      }),
-      // Delegate executeQuery to drizzleAdapter if available (needed for ledger bootstrap)
-      executeQuery:
-        drizzleAdapter &&
-        typeof (drizzleAdapter as { executeQuery?: unknown }).executeQuery ===
-          "function"
-          ? (sql: string, params?: unknown[]) =>
-              (
-                drizzleAdapter as {
-                  executeQuery: (
-                    sql: string,
-                    params?: unknown[]
-                  ) => Promise<unknown>;
-                }
-              ).executeQuery(sql, params)
-          : undefined,
-    };
-
-    // Fail fast: migrateCore requires executeQuery to run file migrations
-    if (!cliAdapter.executeQuery) {
-      throw new Error(
-        "Adapter does not support executeQuery, which is required for running migrations. " +
-          "Please ensure your database adapter (postgres, mysql, or sqlite) is correctly configured. " +
-          "Run `nextly migrate` manually for detailed diagnostics."
-      );
+      return 0;
     }
 
     // Create a logger compatible with migrateCore's CommandContext["logger"]
@@ -388,13 +374,24 @@ async function applyPendingMigrations(label: string): Promise<void> {
       config: configResult.config,
       deferredExtends: configResult.deferredExtends,
     });
-    const result = await migrateCore({
-      dialect: adapterDialect,
-      db,
-      adapter: cliAdapter,
+    // Compiled from the same config the CLI compiles from; see
+    // `MigrateCoreDeps.extensionSchema` for why it is passed, not read.
+    const { compileExtensionSchema } = await import(
+      "../domains/schema/extension/publish"
+    );
+    const extensionSchema = await compileExtensionSchema({
+      dialect: drizzleAdapter.dialect,
+      plugins: configResult.config.plugins ?? [],
+      config: configResult.config,
+      logger: { warn: m => console.warn(m) },
+    });
+    const result = await migrateAtDevBoot({
+      migrateCore,
+      adapter: drizzleAdapter,
+      extensionSchema,
+      pluginMigrations,
       migrationsDir,
       logger,
-      lockMode: "fail-fast",
       ttlSeconds: configResult.config.db.migrateLockTtlSeconds,
       // Boot applies migrations through the same drift verification the CLI
       // does, so it needs the same knowledge of which tables are derived. A
@@ -405,44 +402,21 @@ async function applyPendingMigrations(label: string): Promise<void> {
       // collection rather than the config, and reading the config alone would
       // make boot and CLI disagree about the same database.
       knownJunctions: resolvedSchema.knownJunctions,
-      allowDestructive: allowCoreDestructive,
-      ensureLedger: async () => {
-        const adapter = drizzleAdapter as {
-          executeQuery?: (sql: string, params?: unknown[]) => Promise<unknown>;
-          tableExists?: (name: string) => Promise<boolean>;
-        };
-        // Check if required methods are available
-        if (
-          typeof adapter.executeQuery === "function" &&
-          typeof adapter.tableExists === "function"
-        ) {
-          try {
-            const hasLedger = await adapter.tableExists("nextly_schema_events");
-            if (!hasLedger) {
-              for (const stmt of getSchemaEventsDdl(adapterDialect)) {
-                await adapter.executeQuery(stmt);
-              }
-            }
-          } catch (err) {
-            // Ledger bootstrap failed - log but don't block migration
-            console.warn(
-              `${label} Ledger bootstrap failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        } else {
-          // Methods not available - skip ledger bootstrap
-          console.debug(
-            `${label} Ledger bootstrap skipped - adapter methods not available`
-          );
-        }
-      },
+      label,
     });
 
-    if (result.applied > 0) {
-      console.log(`${label} Applied ${result.applied} migration(s)`);
+    // Both streams count: a boot that ran only plugin modules still applied
+    // something, and saying otherwise sends the reader looking for a run
+    // that did nothing.
+    const applied = result.applied + result.pluginModulesApplied;
+    if (applied > 0) {
+      console.log(`${label} Applied ${applied} migration(s)`);
     } else {
       console.log(`${label} No pending migrations`);
     }
+    return (
+      result.metadata.collectionsRegistered + result.metadata.singlesRegistered
+    );
   } catch (err) {
     // Migration check/apply failed - log but don't block startup
     const msg = err instanceof Error ? err.message : String(err);
@@ -450,5 +424,93 @@ async function applyPendingMigrations(label: string): Promise<void> {
       `${label} Migration auto-apply skipped: ${msg}. ` +
         `Run \`nextly migrate\` manually if needed.`
     );
+    return 0;
   }
+}
+
+/**
+ * What the development boot hands `migrateCore`, declared here because the
+ * runtime may not import the CLI's migrate module, types included. A
+ * `migrateCore` passed in is checked against it wherever it is passed.
+ */
+export interface DevBootMigrateDeps<TLogger> {
+  extensionSchema: ExtensionSchema | undefined;
+  pluginMigrationSets: PluginMigrationSet[];
+  pluginsWithMigrations: Set<string>;
+  dialect: DrizzleAdapter["dialect"];
+  db: ReturnType<DrizzleAdapter["getDrizzle"]>;
+  adapter: DrizzleAdapter;
+  migrationsDir: string;
+  logger: TLogger;
+  lockMode: "fail-fast";
+  ttlSeconds?: number;
+  knownJunctions?: ReadonlySet<string>;
+  allowDestructive: boolean;
+  ensureLedger: () => Promise<void>;
+}
+
+/**
+ * Apply the app's pending migration files at development boot, the plugin
+ * modules before them, through the CLI's own `migrateCore`.
+ *
+ * The adapter is the application's own, as the production boot hands it:
+ * `migrateCore` reads it as the full `DrizzleAdapter` — listing tables,
+ * opening the single-connection transaction a file runs in — so a stand-in
+ * exposing part of that surface would fail on the first app file. The plugin
+ * modules are what `pluginMigrationArgs` returns, the helper the CLI and the
+ * production boot read them from, taken whole: `migrateCore` refuses every
+ * plugin table whose plugin it is not told ships migrations, so a boot passing
+ * none would stop applying the app's own files the moment a plugin declared a
+ * table. The caller reads them, because it also decides from them whether a
+ * project without a migrations directory has anything to run.
+ */
+export async function migrateAtDevBoot<
+  TLogger,
+  TResult extends {
+    applied: number;
+    pluginModulesApplied: number;
+    metadata: { collectionsRegistered: number; singlesRegistered: number };
+  },
+>(args: {
+  migrateCore: (deps: DevBootMigrateDeps<TLogger>) => Promise<TResult>;
+  adapter: DrizzleAdapter;
+  extensionSchema: ExtensionSchema | undefined;
+  pluginMigrations: Awaited<ReturnType<typeof pluginMigrationArgs>>;
+  migrationsDir: string;
+  logger: TLogger;
+  ttlSeconds?: number;
+  knownJunctions?: ReadonlySet<string>;
+  label: string;
+}): Promise<TResult> {
+  const { adapter, label } = args;
+  // Loaded here, as every heavy dependency of this file is, so importing the
+  // boot does not load the migration engine.
+  const { ensureSchemaEventsTable } = await import(
+    "../domains/schema/events/schema-events-ddl"
+  );
+  return args.migrateCore({
+    extensionSchema: args.extensionSchema,
+    ...args.pluginMigrations,
+    dialect: adapter.dialect,
+    db: adapter.getDrizzle(),
+    adapter,
+    migrationsDir: args.migrationsDir,
+    logger: args.logger,
+    lockMode: "fail-fast",
+    ttlSeconds: args.ttlSeconds,
+    knownJunctions: args.knownJunctions,
+    // The development boot lets the core reconcile make destructive changes.
+    allowDestructive: true,
+    ensureLedger: async () => {
+      try {
+        await ensureSchemaEventsTable(adapter);
+      } catch (err) {
+        // A ledger that cannot be created is reported, and the run goes on:
+        // recording an event then fails with the database's own reason.
+        console.warn(
+          `${label} Ledger bootstrap failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+  });
 }
