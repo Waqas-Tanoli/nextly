@@ -27,6 +27,7 @@ This page covers the common deploy patterns. Pick whichever fits your stack.
 | `nextly migrate:resolve` | Recovery: mark a file applied/rolled-back or clean up a failed attempt without running SQL. See [Recovering from a failed migration](#recovering-from-a-failed-migration). |
 | `nextly migrate:fresh` | Wipes all tables and re-applies every migration. Local-dev only. Confirmation required. |
 | `nextly migrate:down` | Rolls back the most-recently-applied migration(s) using their `-- DOWN` section. CLI-only; never runs on boot. See [Rolling back a migration](#rolling-back-a-migration). |
+| `nextly users:clear-plaintext-passwords` | Finds accounts an earlier release left holding a password stored as typed and, with `--apply --confirm-default-hasher`, clears it and ends their sessions. Previews by default. See [Clearing passwords stored as typed](#clearing-passwords-stored-as-typed). |
 
 Global flags inherited from the root `nextly` command: `--config <path>` (custom `nextly.config.ts` path), `--cwd <path>`, `--verbose`, `-q/--quiet`.
 
@@ -41,6 +42,7 @@ Global flags inherited from the root `nextly` command: `--config <path>` (custom
 - `nextly migrate:resolve` -- exactly one of `--applied <file>`, `--rolled-back <file>`, `--failed-cleanup <file>`; `--skip-verify` (with `--applied`, skip the live-vs-snapshot check; a file with no snapshot is recorded without it when it is marked `-- nextly:no-transaction`, or on MySQL when its newest attempt failed or never finished).
 - `nextly migrate:fresh` -- `-f, --force` (skip confirmation), `--seed` (run seeders after migrations).
 - `nextly migrate:down` -- `--step <n>` (roll back the last N migrations), `--allow-data-loss` (required when the DOWN drops a table or column), `--yes` (required in production), `--dry-run` (show targets + DOWN SQL without executing), `--plugin <name>` (roll back that plugin's modules instead of the app's files), `--force-unlock`.
+- `nextly users:clear-plaintext-passwords` -- `--apply` (clear the values and end those accounts' sessions, an access token already issued lasting until it expires; without it the command only counts them), `--confirm-default-hasher` (required with `--apply`: your statement that no stored password was written by a custom `passwordHasher`, now or earlier).
 
 ---
 
@@ -282,6 +284,7 @@ Specific examples:
 4. Discovers pending `.sql` files in your `migrations/` directory (sorted by filename timestamp).
 5. Applies each pending file in one transaction on one connection (on MySQL each DDL statement still commits as it runs; see [database support](/docs/database/support) for MySQL caveats). What a file may contain is below.
 6. Records each applied file in `nextly_schema_events` as a `file_apply` event, opened with `started_at`, `filename` and `sha256` and closed with `ended_at` and `statements_executed`.
+7. Counts the accounts holding a password stored as typed, and when there are any, names the command that clears them. It changes nothing; see [Clearing passwords stored as typed](#clearing-passwords-stored-as-typed).
 
 | Exit code | Meaning |
 |---|---|
@@ -610,6 +613,61 @@ NEXTLY_ALLOW_CORE_DESTRUCTIVE=1 nextly migrate
 The flag disables the refusal for **every** operation in that run, not just the one you
 judged safe. Read the whole list before setting it.
 </Callout>
+
+## Clearing passwords stored as typed
+
+Earlier releases stored some passwords as they were typed instead of hashing them: a
+password of 32 characters or more that contained a colon, given when an account was
+created, and any value sent to `PATCH /api/users/:id/password`. Such a value never let
+anyone sign in, because sign-in only compares against a hash, but it is a readable
+password in your database and in every backup of it.
+
+`nextly migrate` counts these accounts after each run and names the command below. To
+see how many your database holds, without changing anything:
+
+```bash
+nextly users:clear-plaintext-passwords
+```
+
+<Callout type="warn">
+If your app passes, or has ever passed, its own `passwordHasher` to `getNextly`, do not clear
+these accounts.
+The command reads `nextly.config.ts`, not your app's code, so it cannot see that hasher,
+and a hash it wrote in a format the command does not recognise is counted here as
+plain text. Clearing it locks that person out until they reset their password.
+</Callout>
+
+The count never includes a value in a format other password hashers write: an argon2,
+scrypt or pbkdf2 string in the modular-crypt form their libraries write (such as
+`$argon2id$v=19$m=…,t=…,p=…$salt$hash`), or a hex salt and digest joined by a colon. Those
+are left as they are. A value that only starts with `$` is not one of them, and is counted.
+
+Clear them only once the upgraded version serves every instance, with no instance of the
+old one left running. An old instance can still store a password as typed, and one stored
+after the command has passed its account stays until the command runs again. If you can't
+be sure, run it again after the rollout.
+
+To clear them, confirming that no stored password was written by a custom hasher:
+
+```bash
+nextly users:clear-plaintext-passwords --apply --confirm-default-hasher
+```
+
+Without `--confirm-default-hasher`, `--apply` changes nothing and exits with an error.
+
+For each such account it removes the stored value and ends its sessions: none of them can
+be renewed, and an access token already issued stays valid until it expires, within
+fifteen minutes by default. It prints only counts, never an address or a value, and a second run finds nothing
+left to change. Accounts with a proper password, and accounts without one, are left as
+they are.
+
+Clearing the database does not reach your backups. Any backup taken before the command
+ran still holds these passwords as typed: purge or expire those backups, or treat them as
+holding exposed passwords.
+
+What the people affected see: signing in with a password is refused with the same message
+as a wrong password, as it already was. They set a new password with **Forgot password**,
+or an administrator sets one for them.
 
 ## What you should never do
 
