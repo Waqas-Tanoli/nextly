@@ -23,7 +23,9 @@ import {
 } from "../../../auth/authenticated-scope";
 import {
   defineCollection,
+  defineFieldGroup,
   defineSingle,
+  fieldGroup,
   group,
   relationship,
   repeater,
@@ -39,8 +41,11 @@ import {
   type TestNextly,
 } from "../../../plugins/test-nextly";
 import type { CollectionsHandler } from "../../../services/collections-handler";
+import { consoleLogger } from "../../../services/shared";
+import { _resetEnvCache } from "../../../shared/lib/env";
 import type { TrustBound } from "../../../services/collections/trust-grant";
 import { ApiKeyService } from "../../auth/services/api-key-service";
+import { CollectionAccessService } from "../services/collection-access-service";
 
 let current: TestNextly | undefined;
 afterEach(async () => {
@@ -98,6 +103,14 @@ async function boot(dialect: TestDialect): Promise<Fixture> {
   const title = text({ name: "title" });
   current = await createTestNextly({
     ...(dialect === "sqlite" ? {} : { dialect }),
+    // A component that relates to `users`, so a read holding several of its
+    // instances asks about that target from inside each one.
+    fieldGroups: [
+      defineFieldGroup({
+        slug: "byline",
+        fields: [relationship({ name: "person", relationTo: "users" })],
+      }),
+    ],
     collections: [
       defineCollection({ slug: "pages", fields: [title] }),
       defineCollection({
@@ -138,6 +151,11 @@ async function boot(dialect: TestDialect): Promise<Fixture> {
           relationship({ name: "chain", relationTo: "chains" }),
           relationship({ name: "author", relationTo: "users" }),
           relationship({ name: "reviewer", relationTo: "users" }),
+          fieldGroup({
+            name: "bylines",
+            component: "byline",
+            repeatable: true,
+          }),
           upload({ name: "image", relationTo: "media" }),
           group({
             name: "box",
@@ -276,6 +294,7 @@ async function boot(dialect: TestDialect): Promise<Fixture> {
     chain: chainId,
     author,
     reviewer: author,
+    bylines: [{ person: author }, { person: author }],
     image: "media-1",
     box: { nested: pageId },
     lines: [{ item: pageId }],
@@ -335,11 +354,12 @@ async function readRef(
 /** The populated parent, read on the list path. */
 async function listRef(
   fx: Fixture,
-  caller: Caller
+  caller: Caller,
+  depth = 1
 ): Promise<Record<string, unknown>> {
   const result = await fx.handler.listEntries({
     collectionName: "refs",
-    depth: 1,
+    depth,
     routeAuthorized: caller.user !== undefined,
     ...caller,
   });
@@ -475,17 +495,70 @@ describe.each(getConfiguredTestDialects())(
         }>("rbacAccessControlService");
         const checks = vi.spyOn(rbac, "checkAccess");
         try {
-          const data = await readRef(fx, as(fx.userReader));
-          // Both fields relate to the same user, and both carry it.
-          expect(shows(data.author, TITLE.user)).toBe(true);
-          expect(shows(data.reviewer, TITLE.user)).toBe(true);
-          const usersReads = checks.mock.calls.filter(
-            ([query]) =>
-              query.operation === "read" && query.resource === "users"
-          );
-          expect(usersReads).toHaveLength(1);
+          // Depth 2: a component is a level of its own, so a relationship
+          // inside one is populated from the second level.
+          for (const read of [readRef, listRef]) {
+            checks.mockClear();
+            const data = await read(fx, as(fx.userReader), 2);
+            // Both fields relate to the same user, and both carry it, as do
+            // both component instances that relate to it.
+            expect(shows(data.author, TITLE.user)).toBe(true);
+            expect(shows(data.reviewer, TITLE.user)).toBe(true);
+            const bylines = data.bylines as unknown[];
+            expect(bylines).toHaveLength(2);
+            for (const byline of bylines) {
+              expect(shows(byline, TITLE.user)).toBe(true);
+            }
+            const usersReads = checks.mock.calls.filter(
+              ([query]) =>
+                query.operation === "read" && query.resource === "users"
+            );
+            expect(usersReads).toHaveLength(1);
+          }
         } finally {
           checks.mockRestore();
+        }
+      });
+
+      it("reads the Direct API gate's fallback grants on its own database, whatever dialect the process names", async () => {
+        // An embedder's gate, built on its adapter with no access-control
+        // service, in a process whose configured dialect names another
+        // database: the real grant lookup runs on the gate's own tables.
+        const fx = await boot(dialect);
+        const gate = new CollectionAccessService(fx.t.adapter, consoleLogger);
+        const configured = {
+          dialect: process.env.DB_DIALECT,
+          url: process.env.DATABASE_URL,
+        };
+        process.env.DB_DIALECT = dialect === "sqlite" ? "postgresql" : "sqlite";
+        // PostgreSQL's settings need a URL to validate; nothing connects to it.
+        if (dialect === "sqlite") {
+          process.env.DATABASE_URL = "postgres://unused@localhost:1/unused";
+        }
+        _resetEnvCache();
+        try {
+          // The instrument: the process now names another dialect's tables.
+          expect(getDialectTables()).not.toBe(getDialectTables(dialect));
+          const ask = (id: string) =>
+            gate.checkCollectionAccess({
+              collectionName: "pages",
+              operation: "read",
+              user: { id },
+              overrideAccess: false,
+            });
+          // The caller holding `read-pages` is served...
+          expect(await ask(fx.pageReader)).toBeNull();
+          // ...and the control, a caller without it, is refused.
+          expect((await ask(fx.stranger))?.statusCode).toBe(403);
+        } finally {
+          for (const [name, value] of [
+            ["DB_DIALECT", configured.dialect],
+            ["DATABASE_URL", configured.url],
+          ] as const) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+          }
+          _resetEnvCache();
         }
       });
 
