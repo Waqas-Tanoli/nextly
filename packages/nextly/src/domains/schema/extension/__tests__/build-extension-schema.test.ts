@@ -1307,39 +1307,101 @@ describe("a hook whose output moves between builds", () => {
     expect(calls).toBe(1);
   });
 
-  it("accepts one declaration built with its properties in another order", async () => {
-    // The same relation each run, its keys inserted in a different order:
-    // what was declared did not move, so nothing is refused.
-    let run = 0;
-    const entries: [string, unknown][] = [
-      ["name", "author"],
-      ["kind", "one"],
-      ["targetTable", "users"],
-      ["fromColumn", "author_id"],
-    ];
-    const built = await buildExtensionSchema({
+  /** One relation's fields, in the order a hook inserts them. */
+  const authorRelation: [string, unknown][] = [
+    ["name", "author"],
+    ["kind", "one"],
+    ["targetTable", "users"],
+    ["fromColumn", "author_id"],
+  ];
+
+  /**
+   * An app hook declaring `notes` with the `author` relation built from
+   * `entriesOn(run)` on each run, with the check on. `editorId` carries the
+   * implied `editor` edge, so every run declares the same two relation names
+   * whatever `author` points at.
+   */
+  const notesWithRelation = (
+    entriesOn: (run: number) => [string, unknown][]
+  ) => {
+    const runs = { count: 0 };
+    // Each run's table as declared, so a test can check what moved.
+    const declared: { relations: readonly { name: string }[] }[] = [];
+    const input: ExtensionSchemaInput = {
       ...base([], {
         owner: { kind: "app" },
         extend: [
           ({ schema }) => {
-            run += 1;
+            runs.count += 1;
             const relation = Object.fromEntries(
-              run % 2 === 0 ? [...entries].reverse() : entries
+              entriesOn(runs.count)
             ) as unknown as TableRelationInput;
-            schema.addTable(
-              defineTable(
-                "notes",
-                { id: col.id(), authorId: col.ref("users") },
-                { relations: [relation] }
-              )
+            const notes = defineTable(
+              "notes",
+              {
+                id: col.id(),
+                authorId: col.ref("users"),
+                editorId: col.ref("users"),
+              },
+              { relations: [relation] }
             );
+            declared.push(notes);
+            schema.addTable(notes);
           },
         ],
       }),
       refuseNondeterministicHooks: true,
-    });
-    expect(run).toBe(2);
+    };
+    return { input, runs, declared };
+  };
+
+  it("accepts one declaration built with its properties in another order", async () => {
+    // The same relation each run, its keys inserted in a different order:
+    // what was declared did not move, so nothing is refused.
+    const { input, runs } = notesWithRelation(run =>
+      run % 2 === 0 ? [...authorRelation].reverse() : authorRelation
+    );
+    const built = await buildExtensionSchema(input);
+    expect(runs.count).toBe(2);
     expect(built.tables.map(table => table.name)).toContain("notes");
+  });
+
+  it("is refused when a relation's content moves, whatever its key order", async () => {
+    // The control for the case above: the second run points `author` at
+    // another column. Its name and the table's relation count stay the same,
+    // so only a comparison that reads what a relation declares tells the two
+    // runs apart.
+    const { input, runs, declared } = notesWithRelation(run =>
+      authorRelation.map(([key, value]): [string, unknown] =>
+        key === "fromColumn" && run === 2 ? [key, "editor_id"] : [key, value]
+      )
+    );
+    let refused: unknown;
+    try {
+      await buildExtensionSchema(input);
+    } catch (error) {
+      refused = error;
+    }
+    expect(runs.count).toBe(2);
+    // The premise: both runs declare the same relations by name and number.
+    expect(
+      declared.map(table => table.relations.map(relation => relation.name))
+    ).toEqual([
+      ["author", "editor"],
+      ["author", "editor"],
+    ]);
+    expect(NextlyError.isValidation(refused)).toBe(true);
+    // This refusal, not another validation error the moved relation could raise.
+    const errors =
+      (refused as { publicData?: { errors?: { code?: string }[] } })?.publicData
+        ?.errors ?? [];
+    expect(errors.map(error => error.code)).toEqual([
+      "NONDETERMINISTIC_SCHEMA_HOOK",
+    ]);
+    expect((refused as NextlyError).logContext).toMatchObject({
+      owner: "app",
+      hookIndex: 0,
+    });
   });
 });
 
