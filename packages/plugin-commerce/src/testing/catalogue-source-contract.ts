@@ -38,6 +38,16 @@ export interface CatalogueSourceContractOptions {
      * listener's own confirmation cannot show.
      */
     readonly soldFrom?: string;
+    /**
+     * An item made to order or on backorder, for a source that sells any, and
+     * the most one line may ask for, as the source holds it: such an item
+     * holds no stock and caps each line instead, so the cap the source
+     * reports is the cap a cart enforces.
+     */
+    readonly toOrder?: {
+      readonly reference: string;
+      readonly maxPerLine: number;
+    };
   };
 }
 
@@ -155,6 +165,43 @@ export async function catalogueSourceContract(
       }
     }
   );
+
+  const toOrder = fixtures.toOrder?.reference;
+  const cap = fixtures.toOrder?.maxPerLine;
+  if (toOrder !== undefined && cap !== undefined) {
+    add(
+      "reports an item sold to order, with the most a line may ask for",
+      async source => {
+        const [item] = (await source.find({ references: [toOrder] })).map(
+          asItem
+        );
+        expectContract(
+          item !== undefined,
+          `the fixture item ${toOrder} exists`
+        );
+        expectContract(
+          item.stock.kind === "to-order",
+          `${toOrder} is sold to order with a per-line cap, not ${item.stock.kind}`
+        );
+        expectContract(
+          item.stock.maxPerLine === cap,
+          `${toOrder}'s cap is ${String(cap)}, not ${String(item.stock.maxPerLine)}`
+        );
+        const [line] = (
+          await source.price({
+            currency: options.currency,
+            lines: [{ reference: toOrder, quantity: 1 }],
+          })
+        ).map(asLine);
+        expectContract(
+          line.found &&
+            line.stock.kind === "to-order" &&
+            line.stock.maxPerLine === cap,
+          "pricing reports the same kind and cap as finding"
+        );
+      }
+    );
+  }
 
   const probe = await options.create();
 
@@ -348,11 +395,12 @@ async function available(
 ): Promise<number> {
   const [item] = (await source.find({ references: [reference] })).map(asItem);
   expectContract(item !== undefined, `the fixture item ${reference} exists`);
+  const { stock } = item;
   expectContract(
-    item.stock.kind !== "untracked",
+    stock.kind === "counted" || stock.kind === "one-off",
     `the fixture item ${reference} has counted stock`
   );
-  return item.stock.available;
+  return stock.available;
 }
 
 function asItem(answer: unknown): CatalogueItem {
