@@ -24,7 +24,7 @@ import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
 import type { Table, Column } from "drizzle-orm";
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 
-import { hashPassword } from "@nextly/auth/password";
+import { hashPassword, isPasswordHash } from "@nextly/auth/password";
 import {
   CreateLocalUserSchema,
   UpdateUserSchema,
@@ -451,6 +451,41 @@ function isExternalIdentityShape(account: {
   hasPassword: boolean;
 }): boolean {
   return account.isActive && account.verified && !account.hasPassword;
+}
+
+/**
+ * How an update recognises a stored password, set by the caller that knows
+ * the app's configuration. See {@link UserMutationService.updateUser}.
+ */
+export interface UpdateUserOptions {
+  /**
+   * Whether the app configures its own `passwordHasher`. Its hashes can take
+   * any form, and its sign-in verifies them, so with one any stored value
+   * counts as a password. Without one only core's hash does: core signs no
+   * one in with anything else.
+   */
+  customPasswordHasher?: boolean;
+}
+
+/** Whether a stored value is a password, as {@link UpdateUserOptions} says. */
+function storesPassword(
+  value: unknown,
+  customPasswordHasher: boolean
+): boolean {
+  return customPasswordHasher
+    ? typeof value === "string" && value !== ""
+    : isPasswordHash(value);
+}
+
+/**
+ * Whether a verification date names the moment already stored. Compared by
+ * instant: two `Date`s for one moment are never the same object, so a
+ * full-object update passing back the date it read would otherwise count as
+ * verifying the address again, and restamp who vouched for it.
+ */
+function sameVerificationInstant(next: Date, stored: unknown): boolean {
+  if (!(stored instanceof Date || typeof stored === "string")) return false;
+  return new Date(stored).getTime() === next.getTime();
 }
 
 export class UserMutationService extends BaseService {
@@ -1308,7 +1343,7 @@ export class UserMutationService extends BaseService {
         isExternalIdentityShape({
           isActive: values.isActive === true,
           verified: values.emailVerified != null,
-          hasPassword: values.passwordHash != null,
+          hasPassword: isPasswordHash(values.passwordHash),
         })
       ) {
         throw NextlyError.forbidden({
@@ -1551,7 +1586,8 @@ export class UserMutationService extends BaseService {
   async updateUser(
     userId: number | string,
     changes: UpdateUserData,
-    caller: UserWriteCaller = "app"
+    caller: UserWriteCaller = "app",
+    options: UpdateUserOptions = {}
   ): Promise<UserMutationResponse> {
     try {
       // Validate input (merged schema includes custom field validators when configured)
@@ -1621,15 +1657,20 @@ export class UserMutationService extends BaseService {
       // 2) Build updateData (only include fields that actually change)
       const updateData: UserUpdateData = {};
 
+      // Whether the account moves to another address. An update that carries
+      // the address it already has, as a full-object update does, moves
+      // nothing, and is not judged as a move.
+      let addressMoves = false;
+
       // EMAIL
       if (typeof changes.email !== "undefined") {
         const normalizedNewEmail = (changes.email ?? "").trim().toLowerCase();
         const currentEmailNormalized = (currentUser.email ?? "").toLowerCase();
+        addressMoves =
+          normalizedNewEmail !== "" &&
+          normalizedNewEmail !== currentEmailNormalized;
 
-        if (
-          normalizedNewEmail &&
-          normalizedNewEmail !== currentEmailNormalized
-        ) {
+        if (addressMoves) {
           const existing = await this.db.query.users.findFirst({
             where: { email: requireFilterValue(normalizedNewEmail, "email") },
             columns: { id: true, email: true },
@@ -1648,7 +1689,18 @@ export class UserMutationService extends BaseService {
           }
         }
 
-        if (normalizedNewEmail !== "") updateData.email = normalizedNewEmail;
+        // Written when its stored spelling would change: a move, or a row
+        // stored before addresses were lowercased, which sign-in can only find
+        // once rewritten. The same spelling writes nothing, so a stale
+        // full-object update cannot put back an address another request moved
+        // the account from; whether a written one moves the account is asked
+        // again in the transaction, against the row as it is then.
+        if (
+          normalizedNewEmail !== "" &&
+          normalizedNewEmail !== (currentUser.email ?? "")
+        ) {
+          updateData.email = normalizedNewEmail;
+        }
       }
 
       if (
@@ -1688,15 +1740,30 @@ export class UserMutationService extends BaseService {
           // counting as one.
           updateData.emailVerified = undefined;
         } else {
-          // With how it was verified, in the same statement: whoever is
-          // updating the account is who vouched for the address.
-          Object.assign(
-            updateData,
-            emailVerificationColumns(
-              changes.emailVerified,
-              caller === "plugin" ? "plugin" : "admin"
-            )
-          );
+          // Read as a Date, once: the update schema accepts an ISO string as
+          // well, and the column takes a Date on every dialect.
+          const verifiedAt =
+            changes.emailVerified === null
+              ? null
+              : new Date(changes.emailVerified);
+          // A date carried with a new address is the old address's: the
+          // move makes it stale, so it is written as this caller's vouching
+          // rather than kept as whoever verified the old one.
+          if (
+            verifiedAt === null ||
+            addressMoves ||
+            !sameVerificationInstant(verifiedAt, currentUser.emailVerified)
+          ) {
+            // With how it was verified, in the same statement: whoever is
+            // updating the account is who vouched for the address.
+            Object.assign(
+              updateData,
+              emailVerificationColumns(
+                verifiedAt,
+                caller === "plugin" ? "plugin" : "admin"
+              )
+            );
+          }
         }
       }
 
@@ -1721,7 +1788,8 @@ export class UserMutationService extends BaseService {
       // account's row, before the write. Activating or verifying can bring an
       // account into that shape, and an address change keeps it there under
       // an address no provider asserted; a password takes it out. No other
-      // update pays for the locking read.
+      // update pays for the locking read. A written address is asked about
+      // there, since only the locked row says whether it moves the account.
       const guardsExternalIdentity =
         caller === "plugin" &&
         (updateData.isActive !== undefined ||
@@ -1801,7 +1869,8 @@ export class UserMutationService extends BaseService {
             await this.refuseExternalIdentityShape(
               currentUser.id,
               updateData,
-              txDb
+              txDb,
+              options.customPasswordHasher === true
             );
           }
           if (hasFieldUpdates && endsSessions) {
@@ -2142,11 +2211,13 @@ export class UserMutationService extends BaseService {
   private async refuseExternalIdentityShape(
     userId: string | number,
     set: UserUpdateData,
-    txDb: DrizzleTransactionLike
+    txDb: DrizzleTransactionLike,
+    customPasswordHasher: boolean
   ): Promise<void> {
     const { users } = this.tables;
     const read = txDb
       .select({
+        email: users.email,
         isActive: users.isActive,
         emailVerified: users.emailVerified,
         passwordHash: users.passwordHash,
@@ -2157,12 +2228,27 @@ export class UserMutationService extends BaseService {
     const [row] = (
       this.dialect === "sqlite" ? await read : await read.for("update")
     ) as Array<{
+      email: unknown;
       isActive: unknown;
       emailVerified: unknown;
       passwordHash: unknown;
     }>;
     // Gone since the update read it: the write that follows changes no row.
     if (!row) return;
+    // A written address moves the account only when it differs from the one
+    // the row holds now; rewriting a stored spelling in lowercase does not.
+    const moves =
+      set.email !== undefined &&
+      set.email !==
+        (typeof row.email === "string" ? row.email : "").trim().toLowerCase();
+    // Nothing that shapes the account changes: keep its other edits.
+    if (
+      !moves &&
+      set.isActive === undefined &&
+      set.emailVerified === undefined
+    ) {
+      return;
+    }
     // A column this update leaves alone keeps the value the row holds.
     const after = {
       isActive:
@@ -2173,10 +2259,12 @@ export class UserMutationService extends BaseService {
         set.emailVerified !== undefined
           ? set.emailVerified != null
           : row.emailVerified != null,
-      hasPassword:
-        set.passwordHash !== undefined
-          ? set.passwordHash != null
-          : row.passwordHash != null,
+      // A password as the app's sign-in would take one: with core's hashing
+      // only its hash, since a stored value that is not one signs nobody in.
+      hasPassword: storesPassword(
+        set.passwordHash !== undefined ? set.passwordHash : row.passwordHash,
+        customPasswordHasher
+      ),
     };
     if (isExternalIdentityShape(after)) {
       throw NextlyError.forbidden({

@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { hashPassword } from "../../auth/password";
 import { getDialectTables } from "../../database/index";
 import { generateSqliteCoreTableStatements } from "../../database/sqlite-core-tables";
 import { UserMutationService } from "../../domains/users/services/user-mutation-service";
@@ -91,6 +92,9 @@ interface TestDb {
     } & Promise<Record<string, unknown>[]>;
   };
   insert: (table: unknown) => { values: (v: unknown) => Promise<unknown> };
+  update: (table: unknown) => {
+    set: (v: unknown) => { where: (cond: unknown) => Promise<unknown> };
+  };
 }
 
 /** Boot with a plugin that declares nothing, and return its user service. */
@@ -777,6 +781,189 @@ describe.each(getConfiguredTestDialects())(
       // write.
       await coreUsers.update(id, { isActive: true }, CONTEXT);
       expect((await controlColumns(t, id)).isActive).toBe(true);
+    });
+
+    it.each([
+      ["its own address", "email"],
+      ["its own verification date", "emailVerified"],
+    ] as const)(
+      "takes an update to an account core made that carries %s unchanged",
+      async (_, field) => {
+        // As a full-object update does: what was read goes back with the edit.
+        // Carrying a value the account already has moves nothing, so it is
+        // not judged as a move or a fresh verification.
+        const { t, pluginUsers, coreUsers } = await boot(dialect);
+        await seedFounder(coreUsers);
+        const id = await externalAccount(t);
+        const read = await pluginUsers.findById(id, CONTEXT);
+
+        await pluginUsers.update(
+          id,
+          { name: "Renamed", [field]: read[field] },
+          CONTEXT
+        );
+
+        expect((await userRow(t, "external@example.com"))?.name).toBe(
+          "Renamed"
+        );
+        const { users } = getDialectTables();
+        const [row] = await db(t).select().from(users).where(eq(users.id, id));
+        // Still vouched for by the provider, not restamped as the plugin's.
+        expect(row?.emailVerifiedVia).toBe("external");
+      }
+    );
+
+    it("writes no address back to an account moved after the update read it", async () => {
+      // A stale full-object update carries the address the plugin read, and
+      // another request moves the account before the write. Written back, that
+      // address would move the account core made without the check a move
+      // gets; unchanged when read, it is not written at all.
+      const { t, pluginUsers, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await externalAccount(t);
+      const { users } = getDialectTables();
+      between.superAdminCheck = {
+        userId: id,
+        run: async () => {
+          await db(t)
+            .update(users)
+            .set({ email: "moved@example.com" })
+            .where(eq(users.id, id));
+        },
+      };
+
+      await pluginUsers.update(
+        id,
+        { name: "Renamed", email: "external@example.com" },
+        CONTEXT
+      );
+
+      expect((await controlColumns(t, id)).email).toBe("moved@example.com");
+      expect((await userRow(t, "moved@example.com"))?.name).toBe("Renamed");
+    });
+
+    it("rewrites a mixed-case address in lowercase when an update carries it", async () => {
+      // A row stored before addresses were lowercased is found by sign-in
+      // only once rewritten; carrying it unchanged is no move.
+      const { t, pluginUsers, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await externalAccount(t);
+      const { users } = getDialectTables();
+      await db(t)
+        .update(users)
+        .set({ email: "External@Example.com" })
+        .where(eq(users.id, id));
+
+      await pluginUsers.update(
+        id,
+        { name: "Renamed", email: "External@Example.com" },
+        CONTEXT
+      );
+
+      expect((await controlColumns(t, id)).email).toBe("external@example.com");
+    });
+
+    it("records a carried verification date as the plugin's once the address moves", async () => {
+      // The date was the old address's. Moved with a password, as a plugin
+      // may, the new address is the plugin's to vouch for, not the provider's.
+      const { t, pluginUsers, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await externalAccount(t);
+      const read = await pluginUsers.findById(id, CONTEXT);
+
+      await pluginUsers.update(
+        id,
+        {
+          email: "moved@example.com",
+          password: "Passw0rd!long",
+          emailVerified: read.emailVerified,
+        },
+        CONTEXT
+      );
+
+      const { users } = getDialectTables();
+      const [row] = await db(t).select().from(users).where(eq(users.id, id));
+      expect(row?.email).toBe("moved@example.com");
+      expect(row?.emailVerifiedVia).toBe("plugin");
+    });
+
+    it("counts any stored value as a password where the app configures its own hasher", async () => {
+      // That hasher's hashes can take any form, and its sign-in takes them.
+      const { t, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await adminInvite(t, true);
+      const { users } = getDialectTables();
+      await db(t)
+        .update(users)
+        .set({ passwordHash: "custom-hasher:c2FsdA:aGFzaA" })
+        .where(eq(users.id, id));
+
+      await new UserMutationService(t.adapter, consoleLogger).updateUser(
+        id,
+        { emailVerified: new Date() },
+        "plugin",
+        { customPasswordHasher: true }
+      );
+
+      // The control is "counts a stored value that is not a hash as no
+      // password": the same write without the app's hasher is refused.
+      expect((await controlColumns(t, id)).emailVerified).toBe(true);
+    });
+
+    it("refuses activating an account verified after the update read it", async () => {
+      // The update reads the account first, unverified here, and another
+      // request verifies it before the write: judged on that first read, the
+      // activation would make the account core alone makes. The check inside
+      // the write's transaction reads the account as it is then.
+      const { t, pluginUsers, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await adminInvite(t, false);
+      const { users } = getDialectTables();
+      between.superAdminCheck = {
+        userId: id,
+        run: async () => {
+          await db(t)
+            .update(users)
+            .set({ emailVerified: new Date() })
+            .where(eq(users.id, id));
+        },
+      };
+
+      await expect(
+        pluginUsers.update(id, { isActive: true }, CONTEXT)
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+      expect(await controlColumns(t, id)).toMatchObject({
+        isActive: false,
+        emailVerified: true,
+      });
+    });
+
+    it("counts a stored value that is not a hash as no password", async () => {
+      // Such a value signs nobody in, so an active account holding one has
+      // no password, and verifying it makes the account core alone makes.
+      const { t, pluginUsers, coreUsers } = await boot(dialect);
+      await seedFounder(coreUsers);
+      const id = await adminInvite(t, true);
+      const { users } = getDialectTables();
+      await db(t)
+        .update(users)
+        .set({ passwordHash: "Passw0rd!long" })
+        .where(eq(users.id, id));
+
+      await expect(
+        pluginUsers.update(id, { emailVerified: new Date() }, CONTEXT)
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      expect((await controlColumns(t, id)).emailVerified).toBe(false);
+
+      // The control: with a hash stored, the account has a password, and the
+      // same verification is allowed.
+      await db(t)
+        .update(users)
+        .set({ passwordHash: await hashPassword("Passw0rd!long") })
+        .where(eq(users.id, id));
+      await pluginUsers.update(id, { emailVerified: new Date() }, CONTEXT);
+      expect((await controlColumns(t, id)).emailVerified).toBe(true);
     });
   }
 );
