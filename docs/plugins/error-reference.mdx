@@ -25,6 +25,23 @@ Nextly validates plugins **fail-fast at boot** (D7): a bad plugin config stops s
 | `NEXTLY_SCHEMA_CROSS_PLUGIN_RELATION`   | 409    | A plugin relates to (or extends with a relation into) another plugin's entity without declaring `dependsOn` on it.                  | Add the other plugin to `dependsOn`.                                                        |
 | `NEXTLY_SCHEMA_RENAME_UNKNOWN_TARGET`   | 400    | `.rename({ from: to })` names a `from` slug the plugin doesn't contribute.                                                          | Rename only slugs the plugin actually declares.                                             |
 
+## Transforms
+
+A refused `contributes.transforms` change is a `VALIDATION_ERROR`. Each entry in its
+`errors` names the transform in `path` (`plugin:<name>.transform[<index>]`) and the rule
+in `code`:
+
+| `errors[].code`                 | Cause                                                                                                                                       | Fix                                                                               |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `TRANSFORM_DEPENDENCY_MISSING`  | A plugin transforms an entity another plugin declares without listing that plugin in `dependsOn`.                                            | Add the owning plugin to `dependsOn`.                                             |
+| `TRANSFORM_TABLE_CHANGED`       | A transform changes the `dbName`, `status` or `localized` setting of another plugin's entity, or of any entity another plugin has added a field to, or removes or changes one of a plugin entity's unique compound indexes.                                              | Leave the entity's tables as its owner set them.                                  |
+| `TRANSFORM_FIELD_PROTECTED`     | A transform removes, or changes the storage of, a field another plugin declared: its type, column, size, `required`, `unique`, `hasMany` or `repeatable`, relation target or translation, or the type of a JSON-stored or `password` field. | Leave the field's storage alone; only the plugin that declared it may change it. |
+| `TRANSFORM_BEHAVIOUR_PROTECTED` | A transform removes, replaces, moves or repeats an access rule, hook, admin setting or function (a validator, a function default, a nested one such as `preview.url`) a third plugin contributed.                                | Add that plugin to `dependsOn`, or leave what it contributed in place.            |
+
+A transform whose result its entity's own definition would refuse, such as a collection's
+`db: { idType: "serial" }`, carries that definition's code (`DB_ID_TYPE_INVALID` here),
+and its message names the plugin.
+
 ## Schema lifecycle
 
 | Code                                      | Status | Cause                                                                                                                                                                                                                                        | Fix                                                                                                                                                            |
