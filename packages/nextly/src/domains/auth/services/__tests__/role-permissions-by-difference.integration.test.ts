@@ -15,7 +15,9 @@
  * - two seeders running at once on a preset that has drifted bring it back to
  *   exactly its set, with no duplicate assignment, touching no row that stays;
  * - two replacements with different sets, run at once, end as exactly one of
- *   them, never a mix of the two.
+ *   them, never a mix of the two;
+ * - on MySQL, whose table has no foreign key, an assignment whose permission
+ *   is gone is removed rather than read through.
  */
 import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
 import { afterEach, describe, expect, it } from "vitest";
@@ -85,15 +87,14 @@ describe.each(getConfiguredTestDialects())(
       const before = await assignmentRows(handle, roleId);
       expect(before.length).toBeGreaterThan(1);
 
-      // One assignment dropped and one added that the database refuses, so the
-      // removal succeeds and the addition fails: the point at which a
-      // delete-then-insert has already emptied the role. The id names no
-      // permission, which PostgreSQL and SQLite refuse on the foreign key, and
-      // is longer than MySQL's 191-character column, which MySQL refuses
-      // because its table declares no foreign key to fail on.
+      // One assignment dropped and one added that names no permission, so the
+      // removal runs and the addition is refused: the point at which a
+      // delete-then-insert has already emptied the role. Refused on MySQL too,
+      // whose table has no foreign key that would refuse it, so a replacement
+      // never reports success for an assignment that grants nothing.
       const desired = [
         ...before.slice(1).map(row => row.permissionId),
-        `no-such-permission-${"x".repeat(200)}`,
+        "no-such-permission",
       ];
       await expect(
         services(handle).rolePermissions.setRolePermissions(roleId, desired)
@@ -101,6 +102,39 @@ describe.each(getConfiguredTestDialects())(
 
       expect(await assignmentRows(handle, roleId)).toEqual(before);
     });
+
+    // MySQL's table declares no foreign key, so an assignment can outlive its
+    // permission there. The other two remove it with the permission.
+    it.runIf(dialect === "mysql")(
+      "removes an assignment whose permission no longer exists",
+      async () => {
+        handle = await bootSeeded(dialect);
+        const roleId = await adminRoleId(handle);
+        const service = services(handle).rolePermissions;
+        const before = await assignmentRows(handle, roleId);
+        await (handle.adapter as unknown as DrizzleAdapter).insert(
+          "role_permissions",
+          {
+            id: "assignment-of-a-deleted-permission",
+            roleId,
+            permissionId: "a-deleted-permission",
+            createdAt: new Date(),
+          }
+        );
+
+        const listed = await service.listRolePermissions(roleId);
+        expect(listed.map(permission => permission.id).sort()).toEqual(
+          before.map(row => row.permissionId)
+        );
+
+        await service.setRolePermissions(
+          roleId,
+          before.map(row => row.permissionId)
+        );
+
+        expect(await assignmentRows(handle, roleId)).toEqual(before);
+      }
+    );
 
     it("ends as exactly one of two replacements with different sets that run at once", async () => {
       handle = await bootSeeded(dialect);
