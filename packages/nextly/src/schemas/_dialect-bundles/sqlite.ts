@@ -24,6 +24,7 @@ export { nextlyRbacEpoch } from "../rbac-epoch/sqlite";
 export { nextlyPluginSettings } from "../plugin-settings/sqlite";
 export { nextlyOneTimeSecrets } from "../one-time-secrets/sqlite";
 export { nextlyLimitStore } from "../limit-store/sqlite";
+export { nextlySpentChallenges } from "../spent-challenges/sqlite";
 export { nextlySchemaOwners } from "../schema-owners/sqlite";
 export { nextlyWidgetLayout } from "../widget-layout/sqlite";
 

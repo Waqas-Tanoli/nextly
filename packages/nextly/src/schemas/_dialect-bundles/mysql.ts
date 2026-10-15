@@ -24,6 +24,7 @@ export { nextlyRbacEpoch } from "../rbac-epoch/mysql";
 export { nextlyPluginSettings } from "../plugin-settings/mysql";
 export { nextlyOneTimeSecrets } from "../one-time-secrets/mysql";
 export { nextlyLimitStore } from "../limit-store/mysql";
+export { nextlySpentChallenges } from "../spent-challenges/mysql";
 export { nextlySchemaOwners } from "../schema-owners/mysql";
 export { nextlyWidgetLayout } from "../widget-layout/mysql";
 
