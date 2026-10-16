@@ -127,6 +127,7 @@ import {
   autosaveForDocument,
   getAutosaveForDocument,
   requireSnapshotBody,
+  readComparisonParams,
 } from "./versions-methods";
 
 type CollectionsHandlerType = CollectionsHandler;
@@ -360,9 +361,7 @@ export const COLLECTION_VERSION_METHODS: Record<
         entryId: String(p.entryId ?? ""),
         user: userFromParams(p),
         authenticatedScope: readAuthenticatedScope(p),
-        from: Number(p.from),
-        to: Number(p.to),
-        modifiedOnly: p.modifiedOnly === "1" || p.modifiedOnly === "true",
+        ...readComparisonParams(p),
       });
       return respondDoc(diff);
     },
