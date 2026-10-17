@@ -456,4 +456,5 @@ export type {
   ReleaseKind,
   ReleaseMemberAction,
   ReleaseBlockerReason,
+  ReleaseCapabilities,
 } from "./releases/types";
