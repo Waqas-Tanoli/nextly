@@ -60,7 +60,7 @@ import {
 } from "./utils/detect";
 import { emptyDirectory, isDirectoryNotEmpty } from "./utils/fs";
 import { scriptRunner } from "./utils/package-manager-commands";
-import { copyTemplate } from "./utils/template";
+import { copyTemplate, resolveTemplatePath } from "./utils/template";
 
 /**
  * Pick a safe project name when the user has chosen "install in cwd".
@@ -559,7 +559,15 @@ export async function createNextly(
         await generateConfig(cwd, projectType, projectInfo);
         await generateRoutes(cwd, projectInfo);
         await generateAdminPage(cwd, projectInfo);
-        await generateMediaRoutes(cwd, projectInfo);
+        // The template's own media and health routes, so an app Nextly is
+        // added to gets the admin's media route a new project has.
+        reported.push(
+          await generateMediaRoutes(
+            cwd,
+            projectInfo,
+            resolveTemplatePath(options.localTemplatePath)
+          )
+        );
         reported.push(await generateInstrumentation(cwd, projectInfo));
         await generateTypesDirectory(cwd, projectInfo);
         nextConfigPatch = await patchNextConfig(cwd, database);
