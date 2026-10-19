@@ -113,7 +113,11 @@ import {
   withMigrateLock,
 } from "../../domains/schema/pipeline/locks";
 import { snapshotComparableTables } from "../../domains/schema/pipeline/managed-tables";
+import { provisionUserFieldStorage } from "../../domains/users/services/provision-user-field-storage";
+import { UserExtSchemaService } from "../../domains/users/services/user-ext-schema-service";
+import { UserFieldDefinitionService } from "../../domains/users/services/user-field-definition-service";
 import { NextlyError, describeError } from "../../errors";
+import type { UserConfig } from "../../users/config/types";
 import { createContext, type CommandContext } from "../program";
 import {
   createCliAdapter,
@@ -123,7 +127,7 @@ import {
   type SupportedDialect,
 } from "../utils/adapter";
 import { loadConfig, type LoadConfigResult } from "../utils/config-loader";
-import { formatDuration, formatCount } from "../utils/logger";
+import { formatDuration, formatCount, type Logger } from "../utils/logger";
 import {
   discoverMigrationGroups,
   selectVariant,
@@ -467,6 +471,18 @@ export async function runMigrate(
             repairUntracked: options.repairLocalization === true,
           }
         );
+        // After the migrations too, and for the same reason: the user fields'
+        // table follows the config's final schema.
+        const userFields = await provisionUserFieldTables(
+          configResult.configPath ? configResult.config.users : null,
+          adapter as unknown as DrizzleAdapter,
+          logger
+        );
+        if (userFields > 0) {
+          logger.info(
+            `User fields: storage ready for ${formatCount(userFields, "field")}.`
+          );
+        }
       }
     } catch (err) {
       logger.error(describeError(err));
@@ -494,6 +510,37 @@ export async function runMigrate(
   } finally {
     await adapter.disconnect();
   }
+}
+
+/**
+ * Provision `user_ext`, the table the project's user fields are stored in, for
+ * the code-defined fields and the ones defined in the admin. `nextly migrate`
+ * sets up every production database, and a production boot never changes the
+ * schema, so this is the step that gives such a database the table its user
+ * fields are read from. Returns how many fields it holds columns for.
+ *
+ * `users` is null when no config file was loaded. Nothing is done then: the
+ * defaults declare no fields, and syncing that empty list would delete every
+ * code-defined field's definition, as a migrate run from the wrong folder
+ * would otherwise do.
+ */
+export async function provisionUserFieldTables(
+  users: UserConfig | undefined | null,
+  adapter: DrizzleAdapter,
+  logger: Logger
+): Promise<number> {
+  if (users === null) return 0;
+  const fieldDefService = new UserFieldDefinitionService(adapter, logger);
+  return provisionUserFieldStorage({
+    codeFields: users?.fields ?? [],
+    fieldDefService,
+    userExtSchemaService: new UserExtSchemaService(
+      adapter.dialect,
+      fieldDefService,
+      logger
+    ),
+    db: adapter.getDrizzle(),
+  });
 }
 
 /**
