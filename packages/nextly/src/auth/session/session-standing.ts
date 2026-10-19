@@ -13,7 +13,7 @@
  *
  * A number on the user row that rises whenever the account's sessions are
  * ended (`updateUserEndingSessions`), and that every access token carries as
- * its `sev` claim. A token signed before the change carries the old number and
+ * its `nx_sev` claim. A token signed before the change carries the old number and
  * is refused; one signed after carries the new number. Comparing numbers
  * rather than times means no clock is involved: a token issued in the same
  * second as the change, or on an instance whose clock runs ahead, is judged
@@ -51,6 +51,7 @@ import { getDialectTables } from "../../database/index";
 import { container } from "../../di/container";
 import { NextlyError } from "../../errors/nextly-error";
 import { awaitBootMigrations } from "../../init/boot-migrations-gate";
+import { serializeOnSqlite } from "../../shared/lib/run-adapter-transaction";
 import { SESSION_EPOCH_CLAIM } from "../jwt/claims";
 
 /** What the user row says about the sessions the account may hold. */
@@ -123,12 +124,21 @@ interface Reading {
  * its answer goes to the callers already waiting and is not kept. The mark
  * lives on the read and goes with it, so nothing is held for an account once
  * its reads are done.
+ *
+ * A caller for whom `shared` answers false reads alone. It may take a held
+ * answer, which was read and committed before it, but it neither joins a read
+ * that is running nor lets another caller join or keep its own. On SQLite that
+ * is a caller inside an open transaction: a read started elsewhere is queued
+ * behind that transaction, so joining it would wait on the transaction that is
+ * waiting for it, and its own read runs inside the transaction, where the row
+ * may hold a change that has not committed.
  */
 export function createSessionStandingCache(options: {
   read: ReadSessionStanding;
   ttlMs?: number;
   maxEntries?: number;
   now?: () => number;
+  shared?: () => boolean;
 }): SessionStandingCache {
   const ttlMs = options.ttlMs ?? SESSION_STANDING_TTL_MS;
   const maxEntries = options.maxEntries ?? MAX_ENTRIES;
@@ -203,7 +213,20 @@ export function createSessionStandingCache(options: {
       ) {
         return Promise.resolve(entry.standing);
       }
-      return readRow(userId);
+      if (options.shared?.() === false) return options.read(userId);
+      const joined = reading.has(userId);
+      const read = readRow(userId);
+      if (!joined) return read;
+      // The read this caller joined may have queried before a change made on
+      // another instance: the one that signed this token's epoch, or the
+      // account's reactivation, which leaves the epoch where it was. An answer
+      // that is not active, or is older than the token, proves that, so it
+      // reads once more for itself.
+      return read.then(standing =>
+        standing?.isActive !== true || standing.sessionEpoch < tokenEpoch
+          ? readRow(userId)
+          : standing
+      );
     },
 
     forget(userId) {
@@ -237,18 +260,32 @@ function tokenEpoch(claims: Record<string, unknown>): number | undefined {
   return signed < 0 ? undefined : signed;
 }
 
+/** How a token is judged against its account's standing. */
+export interface StandingCheckOptions {
+  /**
+   * Whether an account that is not active refuses the token. True everywhere
+   * a session grants something. The account-state route alone asks with
+   * false, because reporting an inactive account as `disabled` is what it is
+   * for; a deactivation through core still refuses there, since it ends the
+   * account's sessions and so moves the epoch.
+   */
+  activeOnly?: boolean;
+}
+
 /**
  * Whether `standing` admits a token carrying `claims`.
  *
- * Refused when the account no longer exists, is not active, or has had its
- * sessions ended since the token was signed, and when the token's epoch claim
- * is malformed.
+ * Refused when the account no longer exists, is not active (unless
+ * `activeOnly` is false), or has had its sessions ended since the token was
+ * signed, and when the token's epoch claim is malformed.
  */
 export function standingAdmits(
   standing: SessionStanding | null,
-  claims: Record<string, unknown>
+  claims: Record<string, unknown>,
+  options?: StandingCheckOptions
 ): boolean {
-  if (!standing || !standing.isActive) return false;
+  if (!standing) return false;
+  if (options?.activeOnly !== false && !standing.isActive) return false;
   const signed = tokenEpoch(claims);
   return signed !== undefined && signed === standing.sessionEpoch;
 }
@@ -347,11 +384,17 @@ export async function readSessionStanding(
   const { users } = getDialectTables(adapter.getCapabilities().dialect);
   // Typed by the narrow view it is used through, as the RBAC epoch's read is.
   const db: StandingSelect = adapter.getDrizzle();
-  const rows = await db
-    .select({ isActive: users.isActive, sessionEpoch: users.sessionEpoch })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
+  // Through `serializeOnSqlite`, so on SQLite, where every request shares one
+  // connection, the read queues behind another request's open transaction
+  // rather than running inside it: an epoch raised by a write that then rolls
+  // back would otherwise be cached, and refuse the account's live session.
+  const rows = await serializeOnSqlite(adapter, () =>
+    db
+      .select({ isActive: users.isActive, sessionEpoch: users.sessionEpoch })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+  );
   const row = rows[0];
   if (!row) return null;
   // Null on a row written before the column existed, which is epoch zero.
@@ -378,6 +421,9 @@ function cacheFor(adapter: DrizzleAdapter): SessionStandingCache {
     held = {
       cache: createSessionStandingCache({
         read: userId => readSessionStanding(userId, adapter),
+        // Inside an open transaction a read nests in it rather than queueing,
+        // so it must not be shared across that boundary in either direction.
+        shared: () => !adapter.inTransaction(),
         ...(cacheClock ? { now: cacheClock } : {}),
       }),
       adapter,
@@ -393,7 +439,8 @@ function cacheFor(adapter: DrizzleAdapter): SessionStandingCache {
  * after the signature has verified.
  */
 export async function sessionTokenIsCurrent(
-  claims: Record<string, unknown>
+  claims: Record<string, unknown>,
+  options?: StandingCheckOptions
 ): Promise<boolean> {
   const userId = claims.sub;
   if (typeof userId !== "string" || userId === "") return false;
@@ -403,7 +450,7 @@ export async function sessionTokenIsCurrent(
     userId,
     signed
   );
-  return standingAdmits(standing, claims);
+  return standingAdmits(standing, claims, options);
 }
 
 /**
