@@ -1314,6 +1314,34 @@ export class SingleMetadataService {
   }
 
   /**
+   * Moves the values of fields becoming translated into the default language's companion rows,
+   * and returns their names for the companion reconcile to skip.
+   */
+  private async moveJoiningFieldValues(
+    adapter: DrizzleAdapter,
+    input: UpdateSingleSchemaInput,
+    plan: UpdateDdlPlan
+  ): Promise<string[]> {
+    const { moveValuesOfFieldsJoiningTranslation } = await import(
+      "../../i18n/runtime/move-joining-values"
+    );
+    const { getConfigFromDI } = await import("../../../dispatcher/helpers/di");
+    return moveValuesOfFieldsJoiningTranslation(adapter, {
+      slug: input.slug,
+      tableName: input.existing.tableName,
+      // A single's table comes from the same builder as a collection's.
+      builtBy: "collection",
+      defaultLocale: getConfigFromDI()?.localization?.defaultLocale ?? "en",
+      oldFields: plan.previousFields,
+      newFields: plan.fields,
+      wasLocalized: input.wasLocalized,
+      isLocalized: input.isLocalized,
+      wasStatus: input.wasStatus,
+      status: input.hasStatus,
+    });
+  }
+
+  /**
    * Run the plan, reporting how far it got.
    *
    * Returns undefined when the plan owns no status — a flag-only save with no adapter registered
@@ -1343,6 +1371,15 @@ export class SingleMetadataService {
       );
       return plan.ownsMigrationStatus ? "pending" : undefined;
     }
+
+    // A field becoming translated takes its value to the default language's companion row first:
+    // the main ALTER below drops its column. Before the try below, as the migration is: a failure
+    // here stops the save before the main table changes.
+    const joinedBefore = await this.moveJoiningFieldValues(
+      adapter,
+      input,
+      plan
+    );
 
     if (plan.migrationSQL) {
       // Before the try below, which records what it catches: a refusal here has changed nothing
@@ -1390,6 +1427,7 @@ export class SingleMetadataService {
           status: input.hasStatus,
           wasStatus: input.wasStatus,
           adapter,
+          joinedBefore,
         });
       } catch (companionError) {
         // 🔴 The shape is RETRACTED here, never rebound, because nothing at this level knows what
