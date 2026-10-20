@@ -2189,10 +2189,12 @@ export class UserMutationService extends BaseService {
       // this recipient.
       if (changes.sendWelcomeEmail && this.emailService) {
         await this.emailService
-          .sendWelcomeEmail(user!.email, {
-            name: user!.name ?? null,
-            email: user!.email,
-          })
+          .sendWelcomeEmail(
+            user!.email,
+            { name: user!.name ?? null, email: user!.email },
+            // Names the staff user on the delivery records.
+            { staffUserId: String(user!.id) }
+          )
           .then(result => {
             if (!result.success) {
               this.logger.warn("Welcome email was not delivered", {

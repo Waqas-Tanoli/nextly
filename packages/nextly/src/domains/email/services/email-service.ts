@@ -13,6 +13,7 @@
 
 import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
 
+import { toDbError } from "../../../database/errors";
 import { NextlyError } from "../../../errors";
 import {
   getFilterRegistry,
@@ -23,12 +24,18 @@ import {
 } from "../../../filters";
 import { getBaseUrl } from "../../../lib/get-base-url";
 import { maskingServiceLogger } from "../../../observability/mask-emails";
-import { principalRefOf } from "../../../plugins/principals/ref";
+import {
+  isStaffPersonId,
+  principalRefOf,
+  staffPerson,
+  staffPersonOf,
+} from "../../../plugins/principals/ref";
 import { getPrincipalKind } from "../../../plugins/principals/registry";
 import type { PrincipalRef } from "../../../plugins/principals/types";
 import type { EmailTemplateRecord } from "../../../schemas/email-templates/types";
 import type { Logger } from "../../../services/shared";
 import { BaseService } from "../../../shared/base-service";
+import { requireFilterValue } from "../../../shared/lib/require-filter-value";
 import {
   isRecognisedMessageId,
   mailboxOf,
@@ -514,7 +521,7 @@ export class EmailService extends BaseService {
   }): Promise<{ success: boolean; messageId?: string }> {
     // A precondition, before anything is resolved or sent: a person that
     // cannot be read would leave the record unable to be erased with them.
-    const person = personToRecord(options.person);
+    const person = await this.personToRecord(options.person);
 
     // The caller's recipients are a precondition too. They are checked again
     // once filters have run, against the envelope that is actually sent.
@@ -1044,7 +1051,15 @@ export class EmailService extends BaseService {
     to: string,
     user: { name: string | null; email: string },
     token: string,
-    options?: { path?: string }
+    options?: {
+      path?: string;
+      /**
+       * The staff user the email goes to, by id, so its delivery records name
+       * them. Named explicitly, never read off `user`: a caller's user object
+       * may carry an id of its own that is no staff user's.
+       */
+      staffUserId?: string;
+    }
   ): Promise<{ success: boolean; messageId?: string }> {
     const baseUrl = this.getBaseUrl();
     const path =
@@ -1053,15 +1068,20 @@ export class EmailService extends BaseService {
       "/admin/reset-password";
     const resetLink = `${baseUrl}${path}?token=${encodeURIComponent(token)}`;
 
-    return this.sendWithTemplate("password-reset", to, {
-      resetLink,
-      expiresIn: "1 hour",
-      appName: this.getAppName(),
-      userName: user.name ?? user.email,
-      userEmail: user.email,
-      token,
-      year: new Date().getFullYear().toString(),
-    });
+    return this.sendWithTemplate(
+      "password-reset",
+      to,
+      {
+        resetLink,
+        expiresIn: "1 hour",
+        appName: this.getAppName(),
+        userName: user.name ?? user.email,
+        userEmail: user.email,
+        token,
+        year: new Date().getFullYear().toString(),
+      },
+      staffRecipient(options?.staffUserId)
+    );
   }
 
   /**
@@ -1085,7 +1105,15 @@ export class EmailService extends BaseService {
     to: string,
     user: { name: string | null; email: string },
     token: string,
-    options?: { path?: string }
+    options?: {
+      path?: string;
+      /**
+       * The staff user the email goes to, by id, so its delivery records name
+       * them. Named explicitly, never read off `user`: a caller's user object
+       * may carry an id of its own that is no staff user's.
+       */
+      staffUserId?: string;
+    }
   ): Promise<{ success: boolean; messageId?: string }> {
     const baseUrl = this.getBaseUrl();
     const path =
@@ -1094,15 +1122,20 @@ export class EmailService extends BaseService {
       "/admin/verify-email";
     const verifyLink = `${baseUrl}${path}?token=${encodeURIComponent(token)}`;
 
-    return this.sendWithTemplate("email-verification", to, {
-      verifyLink,
-      expiresIn: "24 hours",
-      appName: this.getAppName(),
-      userName: user.name ?? user.email,
-      userEmail: user.email,
-      token,
-      year: new Date().getFullYear().toString(),
-    });
+    return this.sendWithTemplate(
+      "email-verification",
+      to,
+      {
+        verifyLink,
+        expiresIn: "24 hours",
+        appName: this.getAppName(),
+        userName: user.name ?? user.email,
+        userEmail: user.email,
+        token,
+        year: new Date().getFullYear().toString(),
+      },
+      staffRecipient(options?.staffUserId)
+    );
   }
 
   /**
@@ -1121,16 +1154,29 @@ export class EmailService extends BaseService {
   async sendWelcomeEmail(
     to: string,
     user: { name: string | null; email: string },
-    options?: { verifyLink?: string }
+    options?: {
+      verifyLink?: string;
+      /**
+       * The staff user the email goes to, by id, so its delivery records name
+       * them. Named explicitly, never read off `user`: a caller's user object
+       * may carry an id of its own that is no staff user's.
+       */
+      staffUserId?: string;
+    }
   ): Promise<{ success: boolean; messageId?: string }> {
-    return this.sendWithTemplate("welcome", to, {
-      userName: user.name ?? user.email,
-      appName: this.getAppName(),
-      userEmail: user.email,
-      verifyLink: options?.verifyLink ?? "",
-      expiresIn: "24 hours",
-      year: new Date().getFullYear().toString(),
-    });
+    return this.sendWithTemplate(
+      "welcome",
+      to,
+      {
+        userName: user.name ?? user.email,
+        appName: this.getAppName(),
+        userEmail: user.email,
+        verifyLink: options?.verifyLink ?? "",
+        expiresIn: "24 hours",
+        year: new Date().getFullYear().toString(),
+      },
+      staffRecipient(options?.staffUserId)
+    );
   }
 
   /**
@@ -1399,6 +1445,45 @@ export class EmailService extends BaseService {
   }
 
   /**
+   * The person a send names, by kind and id, or null for none: a staff user
+   * (`{ kind: "staff", id }`) or a plugin-defined person. Refused when it is
+   * given and cannot name a person, since a record kept under it could never
+   * be matched by the deletion that erases the person's records; and refused
+   * when it names a staff user who does not exist, for the same reason.
+   */
+  private async personToRecord(value: unknown): Promise<PrincipalRef | null> {
+    if (value === undefined || value === null) return null;
+    const staff = staffPersonOf(value);
+    if (!staff) return pluginPersonToRecord(value);
+    let user: { id: string } | undefined;
+    try {
+      user = await this.db.query.users.findFirst({
+        where: { id: requireFilterValue(staff.id, "person.id") },
+        columns: { id: true },
+      });
+    } catch (error) {
+      // The canonical error, as every other database failure of a send is.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+    if (!user) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "person",
+            code: "NOT_FOUND",
+            message: "`person` names a staff user who does not exist.",
+          },
+        ],
+        logContext: { operation: "email.send" },
+      });
+    }
+    // The id as stored, not as the caller spelled it: on MySQL's usual
+    // case-insensitive collation the two can differ, and the record, the
+    // deleted-people digest and the deletion must all name one spelling.
+    return staffPerson(String(user.id));
+  }
+
+  /**
    * Format a "from" address: `"Name <email>"` or just `"email"`.
    */
   private formatFromAddress(name: string | null, email: string): string {
@@ -1408,12 +1493,26 @@ export class EmailService extends BaseService {
 }
 
 /**
- * The person a send names, by kind and id, or null for none. Refused when it
- * is given and cannot name a person: recorded as it is, it could never be
- * matched by the report that erases the person's records.
+ * The send options that name the staff user a core email goes to, so its
+ * delivery records name them and their deletion erases those records; none
+ * for a caller that named no staff user.
  */
-function personToRecord(value: unknown): PrincipalRef | null {
-  if (value === undefined || value === null) return null;
+function staffRecipient(
+  staffUserId: string | undefined
+): { person: PrincipalRef } | undefined {
+  // An id longer than a record can hold is sent naming nobody, as every core
+  // email was before staff users were named, rather than refused.
+  return isStaffPersonId(staffUserId)
+    ? { person: staffPerson(staffUserId) }
+    : undefined;
+}
+
+/**
+ * The plugin-defined person a send names, by kind and id. Refused when it
+ * cannot name one: recorded as it is, it could never be matched by the report
+ * that erases the person's records.
+ */
+function pluginPersonToRecord(value: unknown): PrincipalRef {
   const ref = principalRefOf(value);
   // Of a kind a running plugin registers, too: a misspelled kind is one no
   // deletion report can name, so a record kept under it would outlive the
@@ -1425,7 +1524,7 @@ function personToRecord(value: unknown): PrincipalRef | null {
         path: "person",
         code: "INVALID",
         message:
-          "`person` must name a plugin-defined person by the full name of a registered kind and an id of 1 to 128 characters.",
+          '`person` must name a staff user (`{ kind: "staff", id }`) or a plugin-defined person by the full name of a registered kind, with an id a delivery record can hold for a staff user, and of 1 to 128 characters for a plugin-defined person.',
       },
     ],
     logContext: { operation: "email.send" },

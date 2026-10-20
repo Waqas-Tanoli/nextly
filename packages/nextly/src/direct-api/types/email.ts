@@ -10,6 +10,7 @@
 import type { OwnerUpdateUndo } from "../../domains/email/services/email-template-service";
 import type { OwnerChangeChoice } from "../../domains/email/template-merge";
 import type { EmailAttachmentInput } from "../../domains/email/types";
+import type { PrincipalRef } from "../../plugins/principals/types";
 import type { EmailProviderType } from "../../schemas/email-providers/types";
 import type { EmailTemplateVersion } from "../../schemas/email-templates/types";
 
@@ -409,6 +410,13 @@ export interface SendEmailArgs extends DirectAPIConfig {
    * from storage and forwards to the provider.
    */
   attachments?: EmailAttachmentInput[];
+  /**
+   * @experimental The person the first `to` address belongs to, by kind and
+   * id: a staff user (`{ kind: "staff", id }`) or a plugin-defined person.
+   * The delivery record names them, so deleting them erases it. A send naming
+   * a staff user who does not exist is refused before anything is sent.
+   */
+  person?: PrincipalRef;
 }
 
 /**
@@ -440,6 +448,13 @@ export interface SendTemplateEmailArgs extends DirectAPIConfig {
    * template's default attachments at send-time (Phase 2).
    */
   attachments?: EmailAttachmentInput[];
+  /**
+   * @experimental The person the first `to` address belongs to, by kind and
+   * id: a staff user (`{ kind: "staff", id }`) or a plugin-defined person.
+   * The delivery record names them, so deleting them erases it. A send naming
+   * a staff user who does not exist is refused before anything is sent.
+   */
+  person?: PrincipalRef;
 }
 
 /**
