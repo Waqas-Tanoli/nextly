@@ -202,6 +202,26 @@ export class AuthService extends BaseService {
   }
 
   /**
+   * Judges a password by the staff password rule and maps a refusal to the
+   * flow's public `VALIDATION_ERROR` at `path`, naming the field but never
+   * the value. Every flow here hashes with bcrypt, so the reach the rule
+   * judges is bcrypt's own — which is what an unnamed check already defaults
+   * to.
+   */
+  private assertPasswordMeetsPolicy(password: string, path: string): void {
+    const passwordStrength = validatePasswordStrength(password);
+    if (!passwordStrength.ok) {
+      throw NextlyError.validation({
+        errors: passwordStrength.errors.map(message => ({
+          path,
+          code: "WEAK_PASSWORD",
+          message,
+        })),
+      });
+    }
+  }
+
+  /**
    * Issue a reset or verification token for the account holding `email`
    * (and, when given, with id `userId`), replacing any earlier token of that
    * kind it holds. Returns the account, or undefined when none holds the
@@ -334,18 +354,8 @@ export class AuthService extends BaseService {
    */
   async registerUser(userData: RegisterUserData): Promise<MinimalUser> {
     // Validate password strength up front so we never reach the DB on a
-    // known-bad input. Per spec §13.8 the validation message names the
-    // field but never the value.
-    const passwordStrength = validatePasswordStrength(userData.password);
-    if (!passwordStrength.ok) {
-      throw NextlyError.validation({
-        errors: passwordStrength.errors.map(message => ({
-          path: "password",
-          code: "WEAK_PASSWORD",
-          message,
-        })),
-      });
-    }
+    // known-bad input.
+    this.assertPasswordMeetsPolicy(userData.password, "password");
 
     // PR 4 (unified-error-system): UsersService.createLocalUser now
     // returns MinimalUser directly and throws NextlyError on failure.
@@ -538,6 +548,11 @@ export class AuthService extends BaseService {
         },
       });
     }
+
+    // R-5: the rule binds whenever a password is set, a change included. The
+    // new password is judged before anything is hashed, so a refusal leaves
+    // the current credential exactly as it was.
+    this.assertPasswordMeetsPolicy(newPassword, "newPassword");
 
     const newPasswordHash = await hashPasswordBcrypt(newPassword);
 
@@ -741,16 +756,7 @@ export class AuthService extends BaseService {
       });
     }
 
-    const passwordStrength = validatePasswordStrength(newPassword);
-    if (!passwordStrength.ok) {
-      throw NextlyError.validation({
-        errors: passwordStrength.errors.map(message => ({
-          path: "newPassword",
-          code: "WEAK_PASSWORD",
-          message,
-        })),
-      });
-    }
+    this.assertPasswordMeetsPolicy(newPassword, "newPassword");
 
     try {
       const passwordHash = await hashPasswordBcrypt(newPassword);
@@ -1185,16 +1191,7 @@ export class AuthService extends BaseService {
       );
     }
 
-    const passwordStrength = validatePasswordStrength(newPassword);
-    if (!passwordStrength.ok) {
-      throw NextlyError.validation({
-        errors: passwordStrength.errors.map(message => ({
-          path: "newPassword",
-          code: "WEAK_PASSWORD",
-          message,
-        })),
-      });
-    }
+    this.assertPasswordMeetsPolicy(newPassword, "newPassword");
 
     const passwordHash = await hashPasswordBcrypt(newPassword);
 
@@ -1295,16 +1292,7 @@ export class AuthService extends BaseService {
     passwordUpdatedAt: Date | null;
     sessionEpoch: number;
   }> {
-    const passwordStrength = validatePasswordStrength(newPassword);
-    if (!passwordStrength.ok) {
-      throw NextlyError.validation({
-        errors: passwordStrength.errors.map(message => ({
-          path: "newPassword",
-          code: "WEAK_PASSWORD",
-          message,
-        })),
-      });
-    }
+    this.assertPasswordMeetsPolicy(newPassword, "newPassword");
 
     // The admin-set password must actually be replaced. A fresh bcrypt salt
     // makes the same plaintext hash differently, so without this check a person
