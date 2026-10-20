@@ -270,6 +270,28 @@ export class AuthService extends BaseService {
     });
   }
 
+  /**
+   * The one construction of the reset-token TOKEN_EXPIRED answer: the
+   * canonical session-expired public message, with the per-token identifier
+   * in logContext. Raised from both places that can see a past-expiry token
+   * — the pre-transaction expiry check, and the failed-claim branch, where
+   * the token expired between that check and the consumption write.
+   */
+  private resetTokenExpiredError(resetToken: {
+    id: number;
+    expires: Date;
+  }): NextlyError {
+    return new NextlyError({
+      code: "TOKEN_EXPIRED",
+      publicMessage: "Your session has expired. Please sign in again.",
+      logContext: {
+        reason: "reset-token-expired",
+        tokenId: resetToken.id,
+        expiredAt: resetToken.expires,
+      },
+    });
+  }
+
   /** The one public error an unusable reset link returns. */
   private invalidResetLinkError(
     logContext: Record<string, unknown>
@@ -678,15 +700,7 @@ export class AuthService extends BaseService {
       // §13.8 mandates the canonical session-expired message for
       // TOKEN_EXPIRED. We use the literal spec message; the per-token
       // identifier moves into logContext.
-      throw new NextlyError({
-        code: "TOKEN_EXPIRED",
-        publicMessage: "Your session has expired. Please sign in again.",
-        logContext: {
-          reason: "reset-token-expired",
-          tokenId: resetToken.id,
-          expiredAt: resetToken.expires,
-        },
-      });
+      throw this.resetTokenExpiredError(resetToken);
     }
 
     const email = resetToken.identifier;
@@ -771,6 +785,13 @@ export class AuthService extends BaseService {
             )
           );
         if (affectedRowCount(spent, this.dialect) !== 1) {
+          // The claim's own boundary (expires > now) decides what zero rows
+          // means: an instant-equal or past expiry is the expiration answer —
+          // the one the shared invalid link hides — and anything else is a
+          // link spent or revoked while it was being read.
+          if (resetToken.expires <= new Date()) {
+            throw this.resetTokenExpiredError(resetToken);
+          }
           throw this.invalidResetLinkError({
             reason: "reset-token-spent-or-revoked",
             tokenId: resetToken.id,
