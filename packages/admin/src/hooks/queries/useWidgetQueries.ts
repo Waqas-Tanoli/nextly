@@ -87,6 +87,26 @@ export interface WidgetQueryRequest {
    * now draws more than was fetched asks again alone (see `fetchedTierFor`).
    */
   sized?: { query: WidgetQuery; tier: SizeTier };
+  /**
+   * The query as the card's SETTINGS ask it, when they change it: what is sent (sized for the
+   * tier when `sized` is given, from this), while `query` -- the widget's declared question --
+   * is what the cache is keyed by.
+   *
+   * 🔴 Kept out of the key for the reason `sized` is. Every card of a dashboard travels in one
+   * partition, so a setting in the key made one card's change a new question for the whole
+   * dashboard: every card went back to its skeleton and the grid announced them all. Sent at
+   * fetch time instead, a change of settings refetches nothing; the card whose shown answer was
+   * asked with other settings asks again alone (see `fetchedAppliedFor`).
+   */
+  applied?: WidgetQuery;
+}
+
+/**
+ * The query a request asks with, before sizing, as one comparable string: what an answer is
+ * filed as having been asked with, and what a card compares against when its settings change.
+ */
+export function appliedKey(request: WidgetQueryRequest): string {
+  return JSON.stringify(request.applied ?? request.query);
 }
 
 /** One card's cell answers, keyed by cell key. */
@@ -137,6 +157,11 @@ export interface UseWidgetQueriesResult {
    * the tier it sent here, so a card that now draws more than was fetched can ask again alone.
    */
   fetchedTierFor: (placementId: string) => SizeTier | undefined;
+  /**
+   * What each placement's answer was asked with (see `appliedKey`), read from the answer, or
+   * from a request that settled by failing; `undefined` while the first request is in flight.
+   */
+  fetchedAppliedFor: (placementId: string) => string | undefined;
 }
 
 /**
@@ -205,6 +230,25 @@ const MALFORMED_SLOT_ERROR =
  * reads it.
  */
 const BATCH_FAILED_ERROR = "Dashboard data could not be loaded.";
+
+/**
+ * What a request that FAILED was asked with, by the error it failed with: a failed request has
+ * no answer to carry it, and without it a card whose settings change after its first request
+ * failed could not tell that it now asks something else, so it stayed on the old failure.
+ * Weakly held, so an error the cache lets go of takes its entry with it.
+ */
+const askedWithByError = new WeakMap<object, Record<string, string>>();
+
+/** Files what the failed `partition` was asked with against the error it threw, then rethrows. */
+function failedAsking(
+  partition: readonly WidgetQueryRequest[],
+  error: unknown
+): never {
+  if (typeof error === "object" && error !== null) {
+    askedWithByError.set(error, appliedSent(partition));
+  }
+  throw error;
+}
 
 /**
  * Narrows the response body before anything is keyed from it.
@@ -700,10 +744,20 @@ export function useWidgetQueries(
       // Built from this render's partition, and TanStack runs the latest observer's function,
       // so a refetch sends each card's CURRENT tier.
       queryFn: async () => {
-        const body = await protectedApi.post<unknown>("/dashboard/query", {
-          queries: partition.map(entry => entry.sized?.query ?? entry.query),
-        });
-        return { slots: readResults(body), tiers: tiersSent(partition) };
+        try {
+          const body = await protectedApi.post<unknown>("/dashboard/query", {
+            queries: partition.map(
+              entry => entry.sized?.query ?? entry.applied ?? entry.query
+            ),
+          });
+          return {
+            slots: readResults(body),
+            tiers: tiersSent(partition),
+            applied: appliedSent(partition),
+          };
+        } catch (error) {
+          return failedAsking(partition, error);
+        }
       },
       staleTime: 0,
       gcTime: 5 * 60 * 1000,
@@ -723,6 +777,8 @@ export function useWidgetQueries(
   // request that wrote it may belong to a render that has since left, and the answer a returning
   // card receives is that request's, at that request's tier.
   const fetchedTiers: Record<string, SizeTier> = emptyRecord();
+  // What each answer was asked with, read from the cached answer for the same reason.
+  const fetchedApplied: Record<string, string> = emptyRecord();
   partitions.forEach((partition, index) => {
     const answer = results[index];
     if (!answer) return;
@@ -742,6 +798,7 @@ export function useWidgetQueries(
         );
       });
       Object.assign(fetchedTiers, answer.data.tiers);
+      Object.assign(fetchedApplied, answer.data.applied);
       return;
     }
 
@@ -758,6 +815,13 @@ export function useWidgetQueries(
           error: BATCH_FAILED_ERROR,
         });
       });
+      // A settled failure was asked with something too, which a change of settings is judged
+      // against; a first request still in flight has neither, and its answer will say.
+      const asked =
+        typeof answer.error === "object" && answer.error !== null
+          ? askedWithByError.get(answer.error)
+          : undefined;
+      if (asked) Object.assign(fetchedApplied, asked);
     }
   });
 
@@ -787,6 +851,12 @@ export function useWidgetQueries(
     return (placementId: string): SizeTier | undefined =>
       Object.hasOwn(tiers, placementId) ? tiers[placementId] : undefined;
   }, [tiersKey]);
+  const appliedKeyOfAll = JSON.stringify(fetchedApplied);
+  const fetchedAppliedFor = useMemo(() => {
+    const applied = JSON.parse(appliedKeyOfAll) as Record<string, string>;
+    return (placementId: string): string | undefined =>
+      Object.hasOwn(applied, placementId) ? applied[placementId] : undefined;
+  }, [appliedKeyOfAll]);
 
   return {
     slots,
@@ -821,7 +891,24 @@ export function useWidgetQueries(
         ? new Date(Math.min(...settledAt))
         : null,
     fetchedTierFor,
+    fetchedAppliedFor,
   };
+}
+
+/**
+ * What each request in `partition` was asked with, by placement: cached with the answer, as
+ * its tier is. A `stats` card's cells are left out; settings do not change them.
+ */
+function appliedSent(
+  partition: readonly WidgetQueryRequest[]
+): Record<string, string> {
+  const applied: Record<string, string> = emptyRecord();
+  for (const entry of partition) {
+    if (entry.cellKey === undefined) {
+      applied[entry.placementId] = appliedKey(entry);
+    }
+  }
+  return applied;
 }
 
 /**
@@ -839,13 +926,14 @@ function tiersSent(
 }
 
 /**
- * A request as the cache keys it: everything but the sizing it is sent with. Named field by
- * field, so a field added to the request is a decision about the key rather than an accident;
- * TanStack's hash drops the `undefined` ones, so an unsized request keys exactly as before.
+ * A request as the cache keys it: everything but the sizing and the settings it is sent with.
+ * Named field by field, so a field added to the request is a decision about the key rather than
+ * an accident; TanStack's hash drops the `undefined` ones, so an unsized request keys exactly as
+ * before.
  */
 function unsized(
   request: WidgetQueryRequest
-): Omit<WidgetQueryRequest, "sized"> {
+): Omit<WidgetQueryRequest, "sized" | "applied"> {
   return {
     placementId: request.placementId,
     cellKey: request.cellKey,
