@@ -97,10 +97,12 @@ import {
 } from "../../../shared/lib/case-conversion";
 import {
   applyFieldReadAccess,
+  callerAccessGrants,
   type ReadAccessRedactions,
   runFieldHooks,
 } from "../../../shared/lib/field-level-registry";
 import {
+  assertFieldGroupPathsFilterable,
   assertFilterableFields,
   assertGroupableField,
   assertNoHiddenColumnFilter,
@@ -124,6 +126,10 @@ import {
 } from "../../../types/pagination";
 import type { PaginatedResponse } from "../../../types/pagination";
 import type { DynamicCollectionService } from "../../dynamic-collections";
+import {
+  liveFieldGroupReadPass,
+  withFieldGroupEvidence,
+} from "../../field-groups/live-read-access";
 import { extractFieldGroupReferences } from "../../field-groups/storage/field-group-field-type";
 import { readFieldGroupType } from "../../field-groups/storage/field-group-type-key";
 import { resolveTypeColumns } from "../../field-groups/storage/resolve-storage-names";
@@ -1270,6 +1276,11 @@ export class CollectionQueryService extends BaseService {
       params.where,
       opts
     );
+    await this.assertFieldGroupFilterable(
+      params.collectionName,
+      params.where,
+      opts
+    );
     await assertSortableField(
       "collection",
       params.collectionName,
@@ -1292,6 +1303,29 @@ export class CollectionQueryService extends BaseService {
       params.collectionName,
       params.groupBy,
       { overrideAccess: opts.overrideAccess, caller: opts.caller }
+    );
+  }
+
+  /**
+   * Refuse a filter on a field-group field the caller may not read, judged by
+   * the field group's own rules: a dotted key whose head is a field-group
+   * field addresses that field group's table, whose rules the collection's
+   * registration does not carry. Only a dotted key can, so a filter with none
+   * reads nothing.
+   */
+  private async assertFieldGroupFilterable(
+    collectionName: string,
+    where: WhereFilter | undefined,
+    opts: NonNullable<Parameters<typeof assertFieldGroupPathsFilterable>[1]>
+  ): Promise<void> {
+    if (opts.overrideAccess || opts.frameworkFilter || !where) return;
+    const keys = [...filterKeys(where)].filter(key => key.includes("."));
+    if (keys.length === 0) return;
+    const collection =
+      await this.collectionService.getCollection(collectionName);
+    await assertFieldGroupPathsFilterable(
+      componentFilterTargets(keys, collectionFieldsFor(collection)),
+      opts
     );
   }
 
@@ -2563,6 +2597,24 @@ export class CollectionQueryService extends BaseService {
     // they cannot drift apart.
     const skipFieldRules =
       params.enforceFieldAccess === true ? false : params.overrideAccess;
+    // The rules on fields inside field groups, which the collection's own pass
+    // does not reach: resolved once for the whole read. Both passes, over
+    // every row, judge with one grants resolver, so the caller's roles are
+    // read once and every rule is handed one authority.
+    const fieldGroupPass = skipFieldRules
+      ? undefined
+      : await liveFieldGroupReadPass(
+          fields as FieldConfig[],
+          this.fieldGroupDataService
+        );
+    const fieldGroupCaller = {
+      user: params.fieldAccessUser ?? params.user,
+      authenticatedScope: params.authenticatedScope,
+      grants: callerAccessGrants(
+        params.fieldAccessUser ?? params.user,
+        params.authenticatedScope
+      ),
+    };
     for (const row of finalData) {
       const sourceRedactions: ReadAccessRedactions = new WeakMap();
       const target = {
@@ -2571,8 +2623,20 @@ export class CollectionQueryService extends BaseService {
         entry: row,
         user: params.fieldAccessUser ?? params.user,
         overrideAccess: skipFieldRules,
+        grants: fieldGroupCaller.grants,
       };
       await applyFieldReadAccess(target, sourceRedactions);
+      // The field-group pass runs before the field-level hooks, so a hook on
+      // an allowed field cannot copy a denied field-group value onto its own,
+      // and again after them, so one a hook put back is caught. Its store is
+      // its own, so the second run restores what the first removed as
+      // evidence, and the collection's second pass can be shown it too.
+      const fieldGroupRedactions: ReadAccessRedactions = new WeakMap();
+      const rowFieldGroupCaller = {
+        ...fieldGroupCaller,
+        redactions: fieldGroupRedactions,
+      };
+      await fieldGroupPass?.(row, rowFieldGroupCaller);
       await runFieldHooks({
         kind: "collection",
         slug: collectionName,
@@ -2581,7 +2645,12 @@ export class CollectionQueryService extends BaseService {
         operation: "read",
         user: params.user,
       });
-      await applyFieldReadAccess(target, sourceRedactions);
+      // Judged against the stored field groups, not the instances the first
+      // field-group pass cut: a collection rule may read a value inside one.
+      await withFieldGroupEvidence(row, fieldGroupRedactions, () =>
+        applyFieldReadAccess(target, sourceRedactions)
+      );
+      await fieldGroupPass?.(row, rowFieldGroupCaller);
     }
 
     // Authoritative related-row sanitization over the assembled response, after
