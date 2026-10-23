@@ -147,6 +147,10 @@ import {
 } from "../../i18n/companion-join";
 import type { SanitizedLocalizationConfig } from "../../i18n/config/types";
 import { EVERY_TRANSLATION } from "../../i18n/locale-selector";
+import {
+  type LocalizationSource,
+  localizationNow,
+} from "../../i18n/localization-source";
 import { resolveLocaleChain } from "../../i18n/resolve-locale";
 import {
   resolveCompanionColumn,
@@ -1004,6 +1008,11 @@ function toBuckets(
 type DynamicSchema = Record<string, SQLWrapper | undefined>;
 
 export class CollectionQueryService extends BaseService {
+  /** The site's languages as they are now: the source may be the language registry. */
+  private get localization(): SanitizedLocalizationConfig | undefined {
+    return localizationNow(this.localizationSource);
+  }
+
   constructor(
     adapter: DrizzleAdapter,
     logger: Logger,
@@ -1018,7 +1027,7 @@ export class CollectionQueryService extends BaseService {
      * reads resolve translatable fields from the companion `_locales` table for the
      * requested locale with fallback. Absent → non-localized behavior (unchanged).
      */
-    private readonly localization?: SanitizedLocalizationConfig,
+    private readonly localizationSource?: LocalizationSource,
     /**
      * What a due release makes visible on this read.
      *
