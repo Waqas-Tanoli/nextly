@@ -1562,7 +1562,10 @@ async function generatePluginPackageJson(
     "@types/react-dom": PINNED_VERSIONS["@types/react-dom"],
     typescript: PINNED_VERSIONS.typescript,
     tsdown: "^0.23.1",
-    vitest: "^4.1.0",
+    vitest: "^5.0.5",
+    // Vitest's peer, declared because Yarn installs no peers: without it a
+    // Yarn-scaffolded plugin installs, and then `yarn test` cannot load Vite.
+    vite: "^7.3.5",
     eslint: PINNED_VERSIONS.eslint,
     "@eslint/js": PINNED_VERSIONS.eslint,
     "typescript-eslint": "^8.0.0",
