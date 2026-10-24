@@ -267,7 +267,13 @@ export function RichTextInput<TFieldValues extends FieldValues = FieldValues>({
 
         {/* Main editor area */}
         <div className="relative" ref={setEditorAnchor}>
-          <div className="max-h-[60vh] overflow-y-auto overscroll-contain">
+          <div
+            className={
+              isEditable
+                ? "max-h-[60vh] overflow-y-auto overscroll-contain"
+                : undefined
+            }
+          >
             <RichTextPlugin
               contentEditable={
                 <ContentEditable
